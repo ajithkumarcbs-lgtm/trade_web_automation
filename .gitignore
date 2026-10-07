@@ -131,6 +131,10 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Bot runtime data: Telegram session, browser profile, database, screenshots, sample messages
+data/
+samples/
 env/
 venv/
 ENV/

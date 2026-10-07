@@ -1,0 +1,6 @@
+telethon>=1.45
+openai>=3.26
+playwright>=1.63
+python-dotenv>=1.2
+pydantic>=2.13
+rapidfuzz>=3.14
