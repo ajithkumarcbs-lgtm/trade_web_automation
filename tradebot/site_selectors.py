@@ -1,48 +1,60 @@
 """Where things are on iob7.com.
 
-Only the login inputs are confirmed (from the site's code). The betting screens could not be
-inspected yet, so every TODO below must be filled in from a page snapshot
-(`python -m tools.snapshot_page`) before the browser bot will start.
+Home page list: confirmed on a saved page (data/snapshots). Match page and bet slip: taken from the
+site's code, Oct 2026. The bot finds the match in the home list, opens its match page, and bets there.
 """
-TODO = "TODO"
+# Home page lists in-play and upcoming cricket and tennis matches.
+LIST_PATH = "/"
+MATCH_URL = "**/sports/details/**"
 
-# Sport list pages. Betfair-style ids (2 = tennis, 4 = cricket): confirm by clicking the sport on the site.
-SPORT_PATHS = {"tennis": "/sport/2", "cricket": "/sport/4"}
-
-LOGIN_PATH = "/login"
-LOGIN_USERNAME = 'input[name="username"]'
+# Header LOGIN button (shown only when logged out) opens the "Login Now" form.
+LOGGED_OUT = 'button:text-is("LOGIN")'
+LOGIN_USERNAME = 'input[name="user"]'  # "username/mobile number"
 LOGIN_PASSWORD = 'input[name="password"]'
-LOGIN_SUBMIT = 'button[type="submit"], button:has-text("Login")'
+LOGIN_SUBMIT = 'button:has-text("Log In")'
 
-# Sport list: one element per match; its text contains both team/player names.
-EVENT_ITEM = TODO
+# Home list: one desktop row per match; its name span reads "<A> v <B>". Clicking it opens the match page.
+EVENT_ROW = 'div[class*="cursor-pointer md:flex"]:has(span.max-line-1)'
+EVENT_NAME = "span.max-line-1"
 
-# Match page: one container per market, whose text includes the market title.
-MARKET_BLOCK = TODO
-MARKET_TITLES = {"match_odds": "Match Odds", "bookmaker": "Bookmaker", "fancy": "Fancy"}
-# One row per team / player / fancy session inside a market block.
-RUNNER_ROW = TODO
-# Clickable odds boxes inside a runner row, left to right.
-# Match Odds desktop: back3 back2 BACK1 | LAY1 lay2 lay3 (mobile shows only BACK1 | LAY1).
-PRICE_CELL = TODO
-FANCY_NO_INDEX = 0
-FANCY_YES_INDEX = 1
+# Match page: one row per team (Match Odds first), name on the left, odds boxes on the right:
+# back3 back2 BACK1 | LAY1 lay2 lay3 (narrow screens show only BACK1 | LAY1).
+RUNNER_ROW = "div.grid.grid-cols-12:has(div.bl-box)"
+RUNNER_NAME = "div.text-ellipsis"
+PRICE_CELL = "div.bl-box"
+SUSPENDED_TEXT = "SUSPENDED"
 
-# Bet slip
-STAKE_INPUT = TODO
-ODDS_INPUT = TODO  # exits type the tipster's price here
-UNMATCH_OPTION = TODO  # the slip's "Place Bet in Unmatch" control, so an exit can wait for its price
-PLACE_BET = 'button:has-text("Place Bet")'
+# Bet slip (blue for back, pink for lay). It exists twice (inline for narrow screens, side panel for
+# wide ones), so the bot uses the visible one. Fields below are searched inside it.
+BET_SLIP = 'div.rounded-b-md:has(input[min="1.01"])'
+ODDS_INPUT = 'input[min="1.01"]'
+STAKE_INPUT = 'input[min="0"]'
+UNMATCH_CHECKBOX = 'input[type="checkbox"]'  # "Place Bet in Unmatch", shown on Match Odds only
 CANCEL_BET = 'button:has-text("Cancel")'
-BET_SUCCESS = TODO
-BET_ERROR = TODO
+PLACE_BET = 'button[class*="bg-[#52b202]"]'
 
+# Messages after placing (react-toastify)
+TOAST = ".Toastify__toast"
+BET_SUCCESS = ".Toastify__toast--success"
+BET_ERROR = ".Toastify__toast--error"
+PRICE_MOVED_ERROR = "unmatch"  # "Unmatch Bet Not Allow." = the price moved before the bet was accepted
 
-def check_configured() -> None:
-    missing = [name for name, value in globals().items() if name.isupper() and value == TODO and name != "TODO"]
-    if missing:
-        raise SystemExit(
-            "Browser selectors not set yet: " + ", ".join(missing) + ".\n"
-            "Run `python main.py --signals-only` meanwhile, and save a match page with "
-            "`python -m tools.snapshot_page` so the selectors can be filled in."
-        )
+# Pop-ups (reactjs-popup): ads after login, notices. Closed with Escape or their close icon.
+POPUP_OVERLAY = "div.popup-overlay"
+POPUP_CLOSE = ".popup-content svg.cursor-pointer, .popup-content [class*='close']"
+
+# If "1 Click Betting" were on, clicking an odds box would place a bet with no slip. Must stay off.
+ONE_CLICK_CHECKBOX = 'div:has-text("1 Click Betting") > input[type="checkbox"]'
+
+# Book set / loss cut: Match Odds header shows "Cashout: <P/L>" when you hold a position.
+# Never use "Turbo Cashout" (7% fee).
+CASHOUT_BUTTON = 'button:has-text("Cashout:")'
+TURBO_CASHOUT = 'div:text-is("Turbo Cashout")'
+CASHOUT_CONFIRM = '.popup-content button:text-is("CASHOUT")'  # "Do you wish to perform cash out?"
+CASHOUT_CANCEL = '.popup-content button:text-is("CANCEL")'
+
+# Open Bets panel (right side of the match page): Unmatch tab lists waiting bets, each with a red cancel
+# circle; the row's cells end with stake, P/L, cancel. Cancelling asks "You want to cancel bet?" -> Yes.
+UNMATCH_TAB = 'div.cursor-pointer:has(> div:text-is("Unmatch"))'
+UNMATCH_CANCEL = 'div.cursor-pointer[class*="bg-[darkred]"]'
+CONFIRM_YES = '.popup-content button:text-is("Yes")'

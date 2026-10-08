@@ -53,7 +53,8 @@ class Settings:
     browser_channel: str
 
     dry_run: bool
-    stake: float
+    unit_stake: float
+    max_units_per_bet: float  # the limits below are off when 0
     max_bets_per_day: int
     max_daily_exposure: float
     max_liability_per_bet: float
@@ -86,12 +87,13 @@ def load_settings() -> Settings:
         headless=_bool("HEADLESS", False),
         browser_channel=_str("BROWSER_CHANNEL", "chrome"),
         dry_run=_bool("DRY_RUN", True),
-        stake=_float("STAKE", 100),
-        max_bets_per_day=_int("MAX_BETS_PER_DAY", 20),
-        max_daily_exposure=_float("MAX_DAILY_EXPOSURE", 2000),
-        max_liability_per_bet=_float("MAX_LIABILITY_PER_BET", 300),
-        min_odds=_float("MIN_ODDS", 1.10),
-        max_odds=_float("MAX_ODDS", 5.0),
+        unit_stake=_float("UNIT_STAKE", _float("STAKE", 100)),  # STAKE: the setting's name before units
+        max_units_per_bet=_float("MAX_UNITS_PER_BET", 5),
+        max_bets_per_day=_int("MAX_BETS_PER_DAY", 0),
+        max_daily_exposure=_float("MAX_DAILY_EXPOSURE", 0),
+        max_liability_per_bet=_float("MAX_LIABILITY_PER_BET", 0),
+        min_odds=_float("MIN_ODDS", 1.01),
+        max_odds=_float("MAX_ODDS", 1000),
         odds_tolerance=_float("ODDS_TOLERANCE", 0.05),
         min_confidence=_float("MIN_CONFIDENCE", 0.7),
         signal_max_age_s=_int("SIGNAL_MAX_AGE_SECONDS", 90),

@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from rapidfuzz import fuzz
-
 from .models import BetSignal, ParsedMessage
+from .names import NAME_MATCH_MIN, name_score
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -45,15 +44,18 @@ CREATE TABLE IF NOT EXISTS positions (
     side        TEXT,
     price       REAL,
     stake       REAL,
-    exit_price  REAL,   -- NULL until an exit bet has been sent
-    exit_status TEXT
+    exit_price  REAL,   -- NULL until a limit exit has been sent
+    exit_status TEXT,
+    exit_stake  REAL,
+    closed      INTEGER DEFAULT 0   -- 1 once cashed out (book set / loss cut)
 );
 """
+# Columns added after the first release; created on older databases at start-up.
+NEW_POSITION_COLUMNS = {"exit_stake": "REAL", "closed": "INTEGER DEFAULT 0"}
 
 # Statuses that count as a bet that exists. "unconfirmed" counts because the bet may be live.
 COUNTED = ("placed", "simulated", "unconfirmed")
 POSITION_WINDOW = timedelta(hours=12)  # an exit only closes a position opened within this time
-NAME_MATCH_MIN = 80
 
 
 @dataclass
@@ -68,6 +70,7 @@ class Position:
     price: float | None
     stake: float
     exit_price: float | None
+    exit_stake: float | None
 
 
 def _now() -> str:
@@ -78,6 +81,11 @@ class Store:
     def __init__(self, path: Path):
         self._db = sqlite3.connect(path)
         self._db.executescript(SCHEMA)
+        existing = {row[1] for row in self._db.execute("PRAGMA table_info(positions)")}
+        for column, kind in NEW_POSITION_COLUMNS.items():
+            if column not in existing:
+                self._db.execute(f"ALTER TABLE positions ADD COLUMN {column} {kind}")
+        self._db.commit()
 
     def log_message(self, tg_id: int, text: str, has_image: bool, parsed: ParsedMessage) -> int:
         cur = self._db.execute(
@@ -134,22 +142,30 @@ class Store:
         self._db.commit()
 
     def find_position(self, selection: str, mode: str) -> Position | None:
-        """Latest position on this selection opened within POSITION_WINDOW (names matched loosely)."""
+        """Latest not-yet-cashed-out position on this selection opened within POSITION_WINDOW.
+        With no selection ('' or '?'), the latest open position of any selection."""
         since = (datetime.now() - POSITION_WINDOW).isoformat(timespec="seconds")
         rows = self._db.execute(
-            "SELECT id, opened_at, sport, event, market, selection, side, price, stake, exit_price FROM positions"
-            " WHERE mode = ? AND opened_at >= ? ORDER BY id DESC",
+            "SELECT id, opened_at, sport, event, market, selection, side, price, stake, exit_price, exit_stake"
+            " FROM positions WHERE mode = ? AND opened_at >= ? AND COALESCE(closed, 0) = 0 ORDER BY id DESC",
             (mode, since),
         ).fetchall()
+        if not selection.strip(" ?"):
+            return Position(*rows[0]) if rows else None
         for row in rows:
-            if fuzz.token_set_ratio(selection.lower(), row[5].lower()) >= NAME_MATCH_MIN:
+            if name_score(selection, row[5]) >= NAME_MATCH_MIN:
                 return Position(*row)
         return None
 
-    def set_exit(self, position_id: int, price: float | None, status: str) -> None:
+    def set_exit(self, position_id: int, price: float, stake: float, status: str) -> None:
         self._db.execute(
-            "UPDATE positions SET exit_price = ?, exit_status = ? WHERE id = ?", (price, status, position_id)
+            "UPDATE positions SET exit_price = ?, exit_stake = ?, exit_status = ? WHERE id = ?",
+            (price, stake, status, position_id),
         )
+        self._db.commit()
+
+    def set_closed(self, position_id: int) -> None:
+        self._db.execute("UPDATE positions SET closed = 1 WHERE id = ?", (position_id,))
         self._db.commit()
 
     def recent_bets(self, limit: int = 50) -> list[dict]:

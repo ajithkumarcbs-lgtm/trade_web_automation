@@ -12,9 +12,21 @@ from .models import ParsedMessage
 CONTEXT_MESSAGES = 15
 CONTEXT_WINDOW = timedelta(hours=6)
 
+# Cricket short forms used by tipsters, expanded to the names the site lists (whole names only).
+TEAM_SHORT_FORMS = {
+    "ind": "India", "wi": "West Indies", "aus": "Australia", "eng": "England", "pak": "Pakistan",
+    "sa": "South Africa", "nz": "New Zealand", "sl": "Sri Lanka", "ban": "Bangladesh", "afg": "Afghanistan",
+    "zim": "Zimbabwe", "ire": "Ireland", "ned": "Netherlands", "sco": "Scotland", "nam": "Namibia",
+}
+
+
+def expand_team(name: str) -> str:
+    return TEAM_SHORT_FORMS.get(name.strip().lower(), name)
+
 
 def context_line(date: datetime, text: str, has_image: bool) -> str:
     return f"[{date:%H:%M}] {text.strip()}{' (image)' if has_image else ''}"
+
 
 INSTRUCTIONS = """\
 You read a Telegram group where a tipster trades cricket and tennis on a betting exchange \
@@ -22,9 +34,18 @@ You read a Telegram group where a tipster trades cricket and tennis on a betting
 Earlier messages are context only (which match is on, which position is open). \
 Never extract bets from them; a bet must be instructed by the NEW message itself.
 
-How this group writes:
-- "<team> back <odds>" or "<team> back <odds> odds" = entry: back that team at those odds, Match Odds.
-- "Limit <odds>" after an entry = exit: lay the same selection at <odds> to take profit.
+How tips are written:
+- "<team> back <odds>" or "<team> back <odds> odds" = entry: back that team at those odds, Match Odds. \
+"<team> lay <odds>" = entry: lay that team.
+- Stake size in units: "1 unit", "2 units", "2u", "half unit" (0.5), "1/2 unit" (0.5) -> units. \
+Stake as money: "Rs 10", "rs10", "₹500", "for 1000", "1000 rs", "1k", "2.5k" -> amount in rupees (10, 500, \
+1000, 1000, 2500). A plain number after the odds is money, not units. Leave both null if the message gives \
+no stake.
+- "Limit <odds>" or "Total <odds> limit" after an entry = exit: take profit on that selection at <odds>.
+- "Book set", "bookset", "book", "book profit", "cashout", "cash out", "loss cut", "losscut", "cut loss", \
+"exit now", "close" = close: close the open position on that selection now.
+- For close and exit, selection is never empty: if the message names no team, it is the team of the latest \
+entry in the earlier messages.
 - "Again back <odds> limit add" or "add" = add: back the same selection again at <odds>.
 - "<team> win", "<team> fav or <odds>", "<n> plus expected", "all out expected", "must play game" \
 = predictions or hype, not bets.
@@ -36,7 +57,12 @@ sa South Africa, nz New Zealand, sl Sri Lanka, ban Bangladesh, afg Afghanistan, 
 
 General rules:
 - back = bet FOR the selection; lay = bet AGAINST it. Fancy/session lines use yes (over) or no (under).
-- Write names in full and the event as "<A> v <B>", taking the opponent from the context: \
+- sport: cricket or tennis when you can tell from the names or context (national teams, IPL/T20 sides, \
+"over", "wicket" = cricket; individual player names = tennis). Use "other" only when it is clearly \
+another sport.
+- Expand the abbreviations listed above (wi -> West Indies). Keep every other team and player name as written \
+in the message or image ("USA" stays "USA", "KKR" stays "KKR"). Write the event as "<A> v <B>", taking the \
+opponent from the context: \
 two teams mentioned together in recent messages (e.g. "ind zone" ... "wi zone") are the two sides of \
 the current match. If the opponent is unknown, write "<A> v ?". Never guess a team that is not in the messages.
 - odds: the price quoted ("6 odds" -> 6, "@1.85" -> 1.85). For fancy, line is the runs number and \
@@ -74,6 +100,11 @@ class SignalParser:
             return ParsedMessage(signals=[], summary="(AI returned no result)")
         for sig in parsed.signals:
             sig.confidence = min(max(sig.confidence, 0.0), 1.0)
+            # A plain back/lay tip that names no market is Match Odds; the AI sometimes says "other".
+            if sig.market == "other" and sig.side in ("back", "lay") and not sig.market_name.strip():
+                sig.market = "match_odds"
+            sig.selection = expand_team(sig.selection)
+            sig.event = " v ".join(expand_team(side) for side in sig.event.split(" v "))
         return parsed
 
 
