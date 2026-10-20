@@ -13,8 +13,9 @@ import json
 import sys
 
 from tradebot.config import ROOT, load_settings
+from tradebot.models import as_bet
 from tradebot.names import NAME_MATCH_MIN, name_score
-from tradebot.signal_parser import SignalParser
+from tradebot.signal_parser import make_parser
 
 CASES = ROOT / "tests" / "parser_cases.json"
 
@@ -41,8 +42,8 @@ def problems_with(parsed, expected: list[dict]) -> list[str]:
 
 async def main(runs: int) -> int:
     settings = load_settings()
-    settings.require("openai_api_key")
-    parser = SignalParser(settings.openai_api_key, settings.openai_model, settings.openai_image_detail)
+    settings.require("groq_api_key" if settings.ai_provider == "groq" else "openai_api_key")
+    parser = make_parser(settings)
     cases = json.loads(CASES.read_text(encoding="utf-8"))
     failed_cases = 0
     for case in cases:
@@ -55,11 +56,11 @@ async def main(runs: int) -> int:
         failed_cases += bool(failures)
         label = "PASS" if not failures else f"FAIL {len(failures)}/{runs}"
         shown = failures[0][0] if failures else parsed
-        got = "; ".join(s.describe() for s in shown.signals) or "no instruction"
+        got = "; ".join(as_bet(s).describe() for s in shown.signals) or "no instruction"
         print(f"{label:9} {case['text']!r:40} -> {got}")
         for problem in failures[0][1] if failures else []:
             print(f"          {problem}")
-    print(f"\n{len(cases) - failed_cases}/{len(cases)} cases passed every run ({runs} run(s), {settings.openai_model})")
+    print(f"\n{len(cases) - failed_cases}/{len(cases)} cases passed every run ({runs} run(s), {parser.name})")
     return 1 if failed_cases else 0
 
 

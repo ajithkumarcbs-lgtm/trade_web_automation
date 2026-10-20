@@ -1,0 +1,82 @@
+{
+  "_comment": "Copy to channels.json (git-ignored) and edit. ids: from `python -m tools.telegram_setup`; a channel keeps its id when renamed. title_regex: chats you join later whose title matches are followed too (the tipster's next tournament channel). settings: .env settings that differ for this channel's trades. auto_bookset_units is a safety net for a bookset message that never comes, so it sits above the tipster's usual booking: on the SS ledger (Sep-Oct 2026) +1 unit would have cut its +22.8 units to +0.1, +3 units to +18.3.",
+
+  "profiles": {
+    "tipster": {
+      "rules": "tipster",
+      "hint": "Tennis trading. Entries: 'Back <player> <odds> odds <units> unit' (often a screenshot caption; the screenshot shows the live price). Exits: 'Bookset' / 'book pannuga' = close now; 'Loss cut 2.5 la' = close now. Nicknames: 'goat' / '🐐' / 'Karupan' = Novak Djokovic. 'Thanks ra bubi' and result posts are not instructions.",
+      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 1.5},
+      "aliases": {"goat": "Novak Djokovic", "karupan": "Novak Djokovic"},
+      "entry_words": "\\b(back|lay|entry|take|taken|try|edunga|podunga|ponga)\\b",
+      "small_units": 0.5,
+      "green_money": "skip",
+      "confirm": {"disagree": true, "below_confidence": 0.8, "above_units": 2}
+    },
+
+    "tipster_open": {
+      "trade": false,
+      "watch_links": true
+    },
+
+    "ss": {
+      "rules": "ss",
+      "voice": true,
+      "hint": "Cricket jackpot trading (tennis sometimes). Entries: '<odds> odds back <team>' or '<team> back <odds> odds', the stake usually in the NEXT message: 'Limit 1', 'Limit 1.5 use', 'Only one limit', 'Half limit'. In this channel 'Losscut' / 'Losscut now' means close the trade NOW (it may be in profit): close with loss_cut true. 'Bookset', 'Now bookset', 'Good profit means bookset' = close now. 'Bookset coming', 'Be active', 'Ready for bookset' = not yet. '<team> win or low odds coming', 'Wait for my entry', zone lists ('1 to 4 over X zone') and '<a> odds to <b> odds jackpot done' are not instructions. 'Taken back <team>' / 'Taken back <team> now' = an entry on that team. 'Open rate back 6.4 odds' = an entry at the opening price. 'Try small amount', 'Try 200 or 300' right after an entry = its stake. Results and price updates ('1.66 fav ban', 'Wi 1.26 fire', 'my side non cutting done', 'Loss 1.5 limit only', 'Small amount i try 4.4k done ✅' — 'done ✅' or a profit amount means a result) are not instructions. Team codes: rno, tus, lim, grb, eci, war, wp, kg, lio, nwd, dol, lmp, mls, hob, ads, vic, sa e (South Africa Emerging).",
+      "aliases": {
+        "rno": "Rhinos", "tus": "Tuskers", "lim": "Limpopo", "grb": "Garden Route Badgers",
+        "eci": "Eastern Cape Iinyathi", "war": "Warriors", "wp": "Western Province", "kg": "Knights",
+        "lio": "Lions", "nwd": "North West Dragons", "dol": "Dolphins", "rock": "Rocks", "lmp": "Limpopo",
+        "hob": "Hobart Hurricanes", "ads": "Adelaide Strikers", "vic": "Victoria", "sa e": "South Africa Emerging"
+      },
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 3.0},
+      "small_units": 0.5,
+      "green_money": "skip",
+      "entry_words": "\\b(back|lay|entry|entries|take|try|edunga|podunga|ponga|khao|lagao)\\b",
+      "stake_wait_s": 45,
+      "limit_followup_s": 180,
+      "confirm": {"disagree": true, "below_confidence": 0.85, "above_units": 2, "no_odds": true}
+    },
+
+    "tennistv": {
+      "rules": "tennistv",
+      "hint": "Tennis in-play tips in Hindi. Entry: '<PLAYER> Win Karo' with '<a> limit use kro <b> limit rhega <PLAYER> pr' = back PLAYER with a units, odds 1 + b/a (the screenshot shows the live price and the full name). 'HALF LIMIT EXTRA' = add. Close now: 'Cashout done x - x limit', 'Bookset lifeset', 'Cashout karlo'. Not a close: 'Cashout khudse kr lena' (cash out yourself), 'Entry kr lena sabhi log cashout khudse krna'. Worksheets ('PASS', 'X/Y'), member testimonials, paribook247 ads, abuse and 'paid group' posts are not instructions.",
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 3.0},
+      "act_on_forwards": false,
+      "entry_words": "\\b(win karo|back|entry|khao|lagao)\\b",
+      "confirm": {"disagree": true, "below_confidence": 0.85, "above_units": 2, "no_odds": true}
+    },
+
+    "strict": {
+      "strict_only": true
+    }
+  },
+
+  "channels": [
+    {
+      "name": "Tipster VIP",
+      "profile": "tipster",
+      "ids": [-1004436642179, -1004381834310],
+      "title_regex": "^(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)\\b"
+    },
+    {
+      "name": "Tipster open group",
+      "profile": "tipster_open",
+      "ids": [-1001878026315]
+    },
+    {
+      "name": "SS sports",
+      "profile": "ss",
+      "ids": [-1003769891853]
+    },
+    {
+      "name": "Tennis Tv",
+      "profile": "tennistv",
+      "ids": [-1001509705209]
+    },
+    {
+      "name": "TEST group",
+      "profile": "strict",
+      "ids": [-5581919170]
+    }
+  ]
+}

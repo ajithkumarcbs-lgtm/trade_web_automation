@@ -131,6 +131,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
+# Your followed Telegram chats (copy channels.example.json)
+channels.json
 
 # Bot runtime data: Telegram session, browser profile, database, screenshots, sample messages
 data/

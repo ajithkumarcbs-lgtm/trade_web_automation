@@ -21,6 +21,9 @@ EVENT_NAME = "span.max-line-1"
 # back3 back2 BACK1 | LAY1 lay2 lay3 (narrow screens show only BACK1 | LAY1).
 RUNNER_ROW = "div.grid.grid-cols-12:has(div.bl-box)"
 RUNNER_NAME = "div.text-ellipsis"
+# Your P/L if that runner wins, under its name (green 9.00 / red -10.00); a second span shows the slip preview.
+# The runners of one market share a parent element.
+RUNNER_BOOK = "div.text-ellipsis + div span"
 PRICE_CELL = "div.bl-box"
 SUSPENDED_TEXT = "SUSPENDED"
 
@@ -30,6 +33,12 @@ BET_SLIP = 'div.rounded-b-md:has(input[min="1.01"])'
 ODDS_INPUT = 'input[min="1.01"]'
 STAKE_INPUT = 'input[min="0"]'
 UNMATCH_CHECKBOX = 'input[type="checkbox"]'  # "Place Bet in Unmatch", shown on Match Odds only
+QUICK_STAKE = "button"  # stake buttons labelled 100, 500, 1K, 5K, 10K ... (also MIN/MAX STAKE, ALL IN, CLEAR)
+SLIP_LIMITS_TEXT = "Min Bet"  # "Min Bet: 10 Max Bet: 25000" in red under the stake buttons
+
+# Header: "BAL <amount>" and "EXP <amount>"; a bet the site accepts changes one of them.
+BALANCE = "xpath=//span[normalize-space(text())='BAL']/b"
+EXPOSURE = "xpath=//span[normalize-space(text())='EXP']/b"
 CANCEL_BET = 'button:has-text("Cancel")'
 PLACE_BET = 'button[class*="bg-[#52b202]"]'
 
@@ -48,7 +57,8 @@ ONE_CLICK_CHECKBOX = 'div:has-text("1 Click Betting") > input[type="checkbox"]'
 
 # Book set / loss cut: Match Odds header shows "Cashout: <P/L>" when you hold a position.
 # Never use "Turbo Cashout" (7% fee).
-CASHOUT_BUTTON = 'button:has-text("Cashout:")'
+# The Match Odds header is itself a <button> containing the Cashout button, so only the innermost one counts.
+CASHOUT_BUTTON = 'button:not(:has(button)):has-text("Cashout:")'
 TURBO_CASHOUT = 'div:text-is("Turbo Cashout")'
 CASHOUT_CONFIRM = '.popup-content button:text-is("CASHOUT")'  # "Do you wish to perform cash out?"
 CASHOUT_CANCEL = '.popup-content button:text-is("CANCEL")'
@@ -56,5 +66,6 @@ CASHOUT_CANCEL = '.popup-content button:text-is("CANCEL")'
 # Open Bets panel (right side of the match page): Unmatch tab lists waiting bets, each with a red cancel
 # circle; the row's cells end with stake, P/L, cancel. Cancelling asks "You want to cancel bet?" -> Yes.
 UNMATCH_TAB = 'div.cursor-pointer:has(> div:text-is("Unmatch"))'
+MATCHED_TAB = 'div.cursor-pointer:has(> div:text-is("Matched"))'
 UNMATCH_CANCEL = 'div.cursor-pointer[class*="bg-[darkred]"]'
 CONFIRM_YES = '.popup-content button:text-is("Yes")'

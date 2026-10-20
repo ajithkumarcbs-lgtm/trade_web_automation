@@ -20,7 +20,7 @@ class FakeParser:
     def __init__(self, script):
         self.script = script
 
-    async def parse(self, text, image=None, context=None):
+    async def parse(self, text, image=None, context=None, reply_to=""):
         return ParsedMessage(signals=self.script[text], summary=text)
 
 
@@ -32,7 +32,7 @@ class FakeSite:
         self.live_price = live_price
         self.calls = []
 
-    async def place(self, sig, position):
+    async def place(self, sig, position, require_green=False):
         self.calls.append((sig.action, sig.selection))
         if sig.action == "entry":
             d = self.risk.price_check(sig, self.live_price)
@@ -124,11 +124,11 @@ class FlakyParser(FakeParser):
         super().__init__(script)
         self.failures = failures
 
-    async def parse(self, text, image=None, context=None):
+    async def parse(self, text, image=None, context=None, reply_to=""):
         if self.failures:
             self.failures -= 1
             raise APIConnectionError(request=None)
-        return await super().parse(text, image, context)
+        return await super().parse(text, image, context, reply_to)
 
 
 @pytest.fixture

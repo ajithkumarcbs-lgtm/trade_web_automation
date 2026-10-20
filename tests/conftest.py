@@ -13,10 +13,14 @@ from tradebot.store import Store  # noqa: E402
 def make_settings(**overrides) -> Settings:
     values = dict(
         tg_api_id=1, tg_api_hash="x", tg_phone="+0", tg_chat=-1,
-        openai_api_key="test", openai_model="test", openai_image_detail="high",
+        openai_api_key="test", openai_model="test", openai_image_detail="high", ai_provider="openai",
+        groq_api_key="", groq_model="test", alerts=False, alert_chat="me", auto_bookset_units=0,
+        bookset_green_wait_s=120, book_only_green=False, bookset_retry_min=10, entry_retry_min=5,
+        monitor_interval_s=20, keepalive_min=0, heartbeat_hours=0,
         site_url="https://example.invalid", site_username="u", site_password="p", headless=True,
         browser_channel="chrome", dry_run=True, unit_stake=1000, max_units_per_bet=5, max_bets_per_day=0,
         max_daily_exposure=0, max_liability_per_bet=0, min_odds=1.01, max_odds=1000, odds_tolerance=0.05,
+        odds_tolerance_abs=0, ignore_slippage=False,
         min_confidence=0.7, signal_max_age_s=90, duplicate_window_min=30,
     )
     values.update(overrides)
@@ -26,7 +30,7 @@ def make_settings(**overrides) -> Settings:
 def signal(**overrides) -> BetSignal:
     values = dict(action="entry", sport="tennis", event="Florian Broska v Lukas Neumayer", market="match_odds",
                   market_name="", selection="Florian Broska", side="back", odds=2.9, line=None, units=None,
-                  amount=None, confidence=0.95)
+                  amount=None, loss_cut=False, confidence=0.95)
     values.update(overrides)
     return BetSignal(**values)
 

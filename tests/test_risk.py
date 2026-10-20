@@ -47,6 +47,28 @@ def test_back_price_must_not_be_worse_than_tip(store):
     assert r.price_check(signal(odds=2.9), 3.2).ok          # better price is fine
 
 
+@pytest.mark.parametrize("live,ok", [(3.6, True), (4.2, True), (3.25, True), (3.2, True), (3.15, False), (1.55, False)])
+def test_absolute_tolerance_of_0_4_odds(store, live, ok):
+    d = risk(store, odds_tolerance_abs=0.4).price_check(signal(odds=3.6), live)
+    assert d.ok is ok
+    if not ok:
+        assert d.reason.startswith("SLIPPAGE_REJECTED") and "lowest allowed 3.20" in d.reason
+
+
+def test_absolute_tolerance_for_lay(store):
+    r = risk(store, odds_tolerance_abs=0.4)
+    assert r.price_check(signal(side="lay", odds=2.0), 2.4).ok
+    assert "SLIPPAGE_REJECTED" in r.price_check(signal(side="lay", odds=2.0), 2.5).reason
+
+
+def test_ignore_slippage_works_in_dry_run_only(store):
+    tip_far_away = signal(odds=3.6)
+    dry = RiskManager(make_settings(ignore_slippage=True), store, "dry_run").price_check(tip_far_away, 1.55)
+    assert dry.ok and "IGNORE_SLIPPAGE" in dry.reason and "1.55" in dry.reason
+    live = RiskManager(make_settings(ignore_slippage=True, dry_run=False), store, "live").price_check(tip_far_away, 1.55)
+    assert not live.ok and live.reason.startswith("SLIPPAGE_REJECTED")
+
+
 def test_lay_price_must_not_be_worse_than_tip(store):
     r = risk(store)
     assert r.price_check(signal(side="lay", odds=1.5), 1.55).ok
@@ -85,6 +107,25 @@ def test_close_without_a_name_uses_the_latest_open_trade(store):
     assert d.ok and d.position.selection == "Namibia"
     d = risk(store).precheck(signal(action="exit", side="lay", odds=1.5, selection="", event="? v ?"))
     assert d.ok and d.position.selection == "Namibia"
+
+
+def test_repeated_bookset_after_booking_is_skipped(store):
+    store.open_position(signal(selection="Djokovic", event="Djokovic v ?"), "dry_run", 2.56, 10)
+    store.set_closed(store.find_position("Djokovic", "dry_run").id)
+    for name in ("Djokovic", "Novak Djokovic", ""):  # "Bookset done guys ✅🐐🥳" with or without a name
+        d = risk(store).precheck(signal(action="close", odds=None, selection=name, event="? v ?"))
+        assert not d.ok and d.reason.startswith("already booked"), name
+
+
+def test_bare_bookset_after_a_booking_does_not_close_an_older_open_trade(store):
+    import time
+    store.open_position(signal(selection="Darderi", event="Darderi v ?"), "dry_run", 5.0, 5)  # never booked
+    time.sleep(1.1)  # timestamps have 1 s resolution
+    store.open_position(signal(selection="Gea", event="Gea v ?"), "dry_run", 5.0, 10)
+    time.sleep(1.1)
+    store.set_closed(store.find_position("Gea", "dry_run").id)  # "Loss cut 2.5 la"
+    d = risk(store).precheck(signal(action="close", odds=None, selection="", event="? v ?"))
+    assert not d.ok and "already booked: Gea" in d.reason  # not a cashout of Darderi
 
 
 def test_close_needs_a_team_or_match(store):

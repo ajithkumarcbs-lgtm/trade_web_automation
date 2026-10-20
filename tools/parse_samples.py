@@ -12,7 +12,8 @@ from collections import deque
 from datetime import datetime, timezone
 
 from tradebot.config import SAMPLES_DIR, load_settings
-from tradebot.signal_parser import CONTEXT_MESSAGES, CONTEXT_WINDOW, SignalParser, context_line
+from tradebot.models import as_bet
+from tradebot.signal_parser import CONTEXT_MESSAGES, CONTEXT_WINDOW, context_line, make_parser
 
 # USD per 1M tokens (input, output), from developers.openai.com model pages, Oct 2026.
 PRICES = {"gpt-5.4-mini": (0.75, 4.50), "gpt-5.4-nano": (0.20, 1.25)}
@@ -27,8 +28,8 @@ def load_sample(stem: str) -> tuple[datetime, str, bytes | None]:
 
 async def main(ids: list[str]) -> None:
     settings = load_settings()
-    settings.require("openai_api_key")
-    parser = SignalParser(settings.openai_api_key, settings.openai_model, settings.openai_image_detail)
+    settings.require("groq_api_key" if settings.ai_provider == "groq" else "openai_api_key")
+    parser = make_parser(settings)
     price_in, price_out = PRICES.get(settings.openai_model, (0, 0))
     total_in = total_out = count = 0
 
@@ -53,7 +54,7 @@ async def main(ids: list[str]) -> None:
         print(f"\n=== {stem}{' [image]' if image else ''}: {text.strip()[:80]!r}")
         print(f"    {parsed.summary}   [{tokens_in} in / {tokens_out} out tokens]")
         for sig in parsed.signals:
-            print(f"    -> {sig.describe()}  (sport={sig.sport}, confidence={sig.confidence:.2f})")
+            print(f"    -> {as_bet(sig).describe()}  (sport={sig.sport}, confidence={sig.confidence:.2f})")
         if not parsed.signals:
             print("    -> no bet")
 

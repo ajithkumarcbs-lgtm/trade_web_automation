@@ -1,4 +1,4 @@
-"""One-time Telegram login, then lists your groups/channels so you can pick TELEGRAM_CHAT.
+"""One-time Telegram login, then lists your groups/channels and their ids, for TELEGRAM_CHAT or channels.json.
 
     python -m tools.telegram_setup
 
@@ -18,11 +18,12 @@ async def main() -> None:
     await client.start(phone=settings.tg_phone)
     me = await client.get_me()
     print(f"\nLogged in as {me.first_name} ({me.phone})\n")
-    print(f"{'TELEGRAM_CHAT id':>18}  name")
+    print(f"{'chat id':>18}  name")
     async for dialog in client.iter_dialogs():
         if dialog.is_group or dialog.is_channel:
             print(f"{dialog.id:>18}  {dialog.name}")
-    print("\nCopy the id of the tips group into TELEGRAM_CHAT in .env")
+    print("\nCopy the ids into the \"ids\" of channels.json (several channels), or one id into TELEGRAM_CHAT in .env."
+          "\nAn id stays the same when a channel is renamed.")
     await client.disconnect()
 
 

@@ -49,6 +49,24 @@ def test_match_page_runner_rows(page):
         assert any(prices) or "SUSPENDED" in row.get_text()
 
 
+SKYFAIR_PAGES = saved_pages("verifyCode")
+
+
+@pytest.mark.skipif(not SKYFAIR_PAGES, reason="no saved sky-fair page")
+@pytest.mark.parametrize("page", SKYFAIR_PAGES, ids=lambda p: p.name)
+def test_skyfair_login_form(page):
+    from tradebot import skyfair
+    soup = bs4.BeautifulSoup(page.read_text(encoding="utf-8"), "html.parser")
+    for selector in (skyfair.LOGIN_USERNAME, skyfair.LOGIN_PASSWORD, skyfair.LOGIN_CODE, skyfair.LOGIN_BUTTON):
+        assert soup.select_one(selector), selector
+    assert soup.select_one("img.verify-code"), "the code is an image a person reads"
+
+
+def test_is_skyfair():
+    from tradebot.skyfair import is_skyfair
+    assert is_skyfair("https://www.sky-fair.website") and not is_skyfair("https://www.iob7.com")
+
+
 def test_cricket_short_forms_are_expanded_but_other_names_kept():
     from tradebot.signal_parser import expand_team
     assert expand_team("Wi") == "West Indies" and expand_team(" IND ") == "India"
