@@ -137,11 +137,15 @@ async def listen(
     on_command: Callable[[str], Awaitable[None]] | None = None,
     on_new_chat: Callable[..., Awaitable[None]] | None = None,
     transcriber=None,
+    on_deleted: Callable[[int, list[int]], Awaitable[None]] | None = None,
+    on_edited: Callable[[int, int, str], Awaitable[None]] | None = None,
 ) -> None:
     """on_message(chat id, message) gets each new message the moment it arrives, as an awaitable that downloads
     its screenshot / transcribes its voice note, so the pipeline keeps each chat's messages in order.
     on_history gets each followed chat's latest messages (oldest first, no images) once at start, as context.
-    on_connected gets the logged-in client, e.g. so alerts can be sent through it."""
+    on_connected gets the logged-in client, e.g. so alerts can be sent through it.
+    on_deleted(chat id, message ids) is told when a followed channel deletes messages (tipsters hiding losses).
+    on_edited(chat id, message id, text) is told when one changes a message."""
     client = make_client(settings)
     await client.start(phone=settings.tg_phone)
     me = await client.get_me()
@@ -168,6 +172,17 @@ async def listen(
                          chat_id, channel.name, "" if channel.profile.trade else " (watch only)")
             except Exception:
                 log.warning("could not open chat %s of channel %s", chat_id, channel.name, exc_info=True)
+
+    @client.on(events.MessageDeleted())
+    async def _deleted(event: events.MessageDeleted.Event) -> None:
+        # Telegram names the chat only for channels / supergroups, which is what tipsters use
+        if on_deleted and event.chat_id and channels.for_chat(event.chat_id):
+            await on_deleted(event.chat_id, list(event.deleted_ids))
+
+    @client.on(events.MessageEdited())
+    async def _edited(event: events.MessageEdited.Event) -> None:
+        if on_edited and channels.for_chat(event.chat_id):
+            await on_edited(event.chat_id, event.message.id, event.message.raw_text or "")
 
     @client.on(events.NewMessage())
     async def _handler(event: events.NewMessage.Event) -> None:

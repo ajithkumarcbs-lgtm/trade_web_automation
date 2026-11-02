@@ -69,6 +69,14 @@ def test_ignore_slippage_works_in_dry_run_only(store):
     assert not live.ok and live.reason.startswith("SLIPPAGE_REJECTED")
 
 
+def test_paper_doesnt_fill_a_lay_at_the_other_runners_price(store):
+    """Tennis Professor 31 Oct: '30p hai khao' read as a lay of H Dart, who was 4.4: Sun was the 1.30. It lost 3400."""
+    paper = RiskManager(make_settings(ignore_slippage=True), store, "dry_run")
+    wrong_runner = paper.price_check(signal(side="lay", odds=1.3), 4.4)
+    assert not wrong_runner.ok and wrong_runner.reason.startswith("SLIPPAGE_REJECTED")
+    assert "IGNORE_SLIPPAGE" in paper.price_check(signal(side="lay", odds=1.8), 2.1).reason  # a price that moved
+
+
 def test_lay_price_must_not_be_worse_than_tip(store):
     r = risk(store)
     assert r.price_check(signal(side="lay", odds=1.5), 1.55).ok

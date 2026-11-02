@@ -179,6 +179,40 @@ def test_groq_reader_retries_unreadable_reply():
     assert asyncio.run(parser.parse("hello")).summary == "chat"
 
 
+def test_groq_reads_the_screenshot_too():
+    parser = SignalParser("", "unused", groq_key="test-key")
+    seen = {}
+
+    async def create(**kwargs):
+        seen["content"] = kwargs["messages"][1]["content"]
+        return groq_reply(json.dumps({"summary": "chat", "signals": []}))
+
+    parser._groq.chat.completions.create = create
+    asyncio.run(parser.parse("Back him", b"\xff\xd8 jpeg bytes"))
+    assert seen["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_groq_wait_times_are_read():
+    from tradebot.signal_parser import _retry_after
+    assert _retry_after("Limit 8000, Used 7900, Requested 3100. Please try again in 23.5s. Need more") == 23.5
+    assert _retry_after("Please try again in 20m16.512s.") == 20 * 60 + 16.512
+    assert _retry_after("Please try again in 830ms.") == 0.83
+    assert _retry_after("no hint") is None
+
+
+def test_groq_is_sent_the_short_format_not_the_schema():
+    parser = SignalParser("", "unused", groq_key="test-key")
+    seen = {}
+
+    async def create(**kwargs):
+        seen["system"] = kwargs["messages"][0]["content"]
+        return groq_reply(json.dumps({"summary": "chat", "signals": []}))
+
+    parser._groq.chat.completions.create = create
+    asyncio.run(parser.parse("hello"))
+    assert "Reply with one JSON object only" in seen["system"] and '"properties"' not in seen["system"]
+
+
 def test_missing_confidence_counts_as_unreadable():
     parser = SignalParser("", "unused", groq_key="test-key")
 
@@ -187,3 +221,103 @@ def test_missing_confidence_counts_as_unreadable():
 
     parser._groq.chat.completions.create = create
     assert asyncio.run(parser.parse("Broska")).signals[0].confidence == 0.0
+
+
+def test_a_null_side_is_filled_in_not_read_again():
+    """A voice close naming no team came back with side and selection null: 8 readings of one note, and the free tier."""
+    parser = SignalParser("", "unused", groq_key="test-key")
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(1)
+        return groq_reply(json.dumps({"summary": "close", "signals": [
+            {"action": "close", "selection": None, "side": None, "odds": None, "confidence": 0.9}]}))
+
+    parser._groq.chat.completions.create = create
+    sig = asyncio.run(parser.parse("(voice note) bookset")).signals[0]
+    assert (sig.action, sig.selection, sig.side) == ("close", "", "back") and len(calls) == 1
+
+
+def test_the_ai_picks_the_listed_side_a_first_name_means():
+    parser = SignalParser("", "unused", groq_key="test-key")
+    listed = ["Musetti v Tiafoe", "T Griekspoor v Nakashima"]
+    replies = {"Tallon": [{"full_name": "Tallon Griekspoor", "index": 1, "side": "Griekspoor"}],
+               "Frances": [{"full_name": "", "index": None, "side": ""},  # the first model doesn't know him
+                           {"full_name": "Frances Tiafoe", "index": "0", "side": "Tiafoe"}],
+               "Zizou": [{"index": 0, "side": "Bergs"}, {"index": 7, "side": "Bergs"}, {}]}  # never a listed side
+    asked = []
+
+    async def create(**kwargs):
+        prompt = kwargs["messages"][1]["content"]
+        assert "1. T Griekspoor v Nakashima" in prompt
+        name = prompt.split(":")[1].split("(")[0].strip()
+        asked.append(name)
+        return groq_reply(json.dumps(replies[name].pop(0)))
+
+    parser._groq.chat.completions.create = create
+    assert asyncio.run(parser.resolve_name("Tallon", "Tallon v Brandon", listed)) == "T Griekspoor"  # as listed
+    assert asyncio.run(parser.resolve_name("Frances", "Frances v ?", listed)) == "Tiafoe"  # the next model knew
+    assert asyncio.run(parser.resolve_name("Zizou", "Zizou v ?", listed)) is None
+    assert asked == ["Tallon", "Frances", "Frances", "Zizou", "Zizou", "Zizou"]
+
+
+def test_the_ai_answer_on_a_womens_match_is_not_taken_for_the_side_listed_first():
+    """31 Oct: SS '3.1 odds star back': the AI said Melbourne Stars W, the bot backed Adelaide Strikers W."""
+    from tradebot.signal_parser import _listed_side
+    listed = ["Adelaide Strikers W v Melbourne Stars W"]
+    assert _listed_side({"index": 0, "side": "Melbourne Stars W"}, listed) == "Melbourne Stars W"
+    assert _listed_side({"index": 0, "side": "Melbourne Stars"}, listed) == "Melbourne Stars W"
+    assert _listed_side({"index": 0, "side": "Women"}, listed) is None
+    assert _listed_side({"index": 0, "side": "W"}, listed) is None
+
+
+def test_a_first_name_the_site_doesnt_list_is_found_by_the_ai(store):
+    """28 Oct: 'Tallon PLUS KARO' and 'Quentin Win' were missed: the site lists 'T Griekspoor v Nakashima'. The
+    AI's pick must fit the initial the site shows, and is kept for the retries (every 10 s)."""
+    from tradebot.exchange_bot import ExchangeBot, _initials_fit
+    settings = make_settings()
+    bot = ExchangeBot(settings, RiskManager(settings, store, "dry_run"))
+    listed = ["Musetti v Tiafoe", "T Griekspoor v Nakashima", "Ha Shi v D Yastremska"]
+    asked = []
+
+    async def resolve(name, event, names):
+        asked.append(name)
+        return {"Tallon": "T Griekspoor", "Dayana": "Ha Shi"}.get(name)
+
+    bot.resolve_name = resolve
+    assert asyncio.run(bot._found_by_ai(listed, "Tallon v Brandon", ["Tallon"])) == {"T Griekspoor": 1}
+    assert asyncio.run(bot._found_by_ai(listed, "Tallon v ?", ["Tallon"])) == {"T Griekspoor": 1}
+    assert asked == ["Tallon"]  # kept: the retries don't ask again
+    assert asyncio.run(bot._found_by_ai(listed, "Dayana v ?", ["Dayana"])) == {}  # Dayana doesn't start with 'Ha'
+    assert asyncio.run(bot._found_by_ai(listed, "Diane v ?", ["Diane"])) == {}  # the AI can't tell
+    assert asyncio.run(bot._found_by_ai(listed, "Diane v ?", ["Diane"])) == {} and asked.count("Diane") == 1
+    assert asyncio.run(bot._found_by_ai(listed, "Rafael Nadal v ?", ["Rafael Nadal"])) == {}  # full names: not asked
+    assert _initials_fit("pkr", "Pokhara Avengers") and _initials_fit("han", "Ha Shi")
+
+
+def test_womens_teams_are_found_by_their_own_name():
+    """31 Oct: SK Astro 'Adelaide Strikers Women' wasn't found on the site's 'Adelaide Strikers W v Melbourne Stars W'."""
+    from tradebot.names import contains_player
+    match = "Adelaide Strikers W v Melbourne Stars W"
+    assert contains_player("Adelaide Strikers Women", match) and contains_player("Stars W", match)
+    assert not contains_player("Hobart Hurricanes W", match)  # 'W' alone says nothing
+    assert not contains_player("India W", "India v Australia")  # not the men's match
+    assert contains_player("Melbourne Stars", match)
+
+
+def test_khao_means_lay_is_told_to_the_ai():
+    """'COLOMBO Favourite Par Khao, JAFFNA Plus Karna Hai': Kartik's calls were being backed, the opposite."""
+    from pathlib import Path
+    from tradebot.signal_parser import INSTRUCTIONS
+    assert '"Khao"' in INSTRUCTIONS and "LAY that team" in INSTRUCTIONS
+    path = Path(__file__).resolve().parent.parent / "channels.example.json"
+    kartik = json.loads(path.read_text(encoding="utf-8"))["profiles"]["kartik"]["hint"]
+    assert "side lay" in kartik and "= back that team" not in kartik
+
+
+def test_a_suspended_tennis_market_is_retried_longer(store):
+    settings = make_settings()
+    pipe = Pipeline(settings, "dry_run", None, RiskManager(settings, store, "dry_run"), store)
+    assert pipe._retry_minutes(signal(), "market suspended") == 10
+    assert pipe._retry_minutes(signal(), "match not found on site: Tallon v ?") == 5
+    assert pipe._retry_minutes(signal(sport="cricket"), "market suspended") == 5

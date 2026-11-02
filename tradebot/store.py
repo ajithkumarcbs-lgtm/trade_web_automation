@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .ladder import Ladder
 from .models import BetSignal, ParsedMessage
 from .names import NAME_MATCH_MIN, contains_player, name_score, same_name
 
@@ -68,14 +69,74 @@ CREATE TABLE IF NOT EXISTS followed (  -- chats followed while running (/follow,
     title       TEXT,
     added_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS price_log (  -- each open trade's closing price as checked (every ~20 s): its path, so exit
+    position_id INTEGER,                -- rules ("book once it reaches even", hedges) can be tested on real moves
+    at          TEXT,
+    price       REAL
+);
+CREATE TABLE IF NOT EXISTS fancy (  -- fancy (session) tips, kept on paper and settled from Cricbuzz's scores
+    id          INTEGER PRIMARY KEY,
+    created_at  TEXT,
+    mode        TEXT,
+    channel     TEXT,
+    message_id  INTEGER,
+    event       TEXT,
+    team        TEXT,
+    kind        TEXT,     -- runs | wicket
+    number      INTEGER,  -- over (runs; 0 = innings total) or wicket number
+    line        REAL,
+    side        TEXT,     -- yes | no
+    rate        REAL,
+    units       REAL,
+    match_id    INTEGER,  -- Cricbuzz match
+    outcome     TEXT,     -- won | lost | unknown; NULL while open
+    pl          REAL,     -- units
+    note        TEXT,
+    settled_at  TEXT,
+    site_name   TEXT,     -- the site's row when the tip came ('15 Over MLSW'), its line and rate for this side,
+    site_line   REAL,     -- so the tip's result can be compared with what the site really offered then
+    site_rate   REAL,
+    site_pl     REAL      -- units, at the site's line and rate
+);
+CREATE TABLE IF NOT EXISTS ladders (  -- tips traded by laying the other team in steps (tradebot/ladder.py)
+    id          INTEGER PRIMARY KEY,
+    created_at  TEXT,
+    mode        TEXT,
+    channel     TEXT,
+    message_id  INTEGER,
+    team        TEXT,
+    event       TEXT,
+    sport       TEXT DEFAULT 'cricket',
+    start_at    TEXT,
+    other       TEXT DEFAULT '',
+    first_price REAL,
+    last_step   INTEGER DEFAULT -1,
+    stopped     INTEGER DEFAULT 0,
+    ended_at    TEXT,
+    end_reason  TEXT
+);
+CREATE TABLE IF NOT EXISTS jackpot_days (  -- days SK Astro named: from its posts, or /jackpot
+    day         TEXT PRIMARY KEY,
+    source      TEXT,
+    added_at    TEXT
+);
 """
 # Columns added after the first release; created on older databases at start-up.
 NEW_POSITION_COLUMNS = {"exit_stake": "REAL", "closed": "INTEGER DEFAULT 0", "closed_at": "TEXT",
                         "close_pending_since": "TEXT", "close_loss_cut": "INTEGER DEFAULT 0",
-                        "channel": "TEXT DEFAULT ''", "closed_pl": "REAL", "closed_how": "TEXT"}
+                        "channel": "TEXT DEFAULT ''", "closed_pl": "REAL", "closed_how": "TEXT", "league": "TEXT"}
 POSITION_COLUMNS = ("id, opened_at, sport, event, market, selection, side, price, stake, exit_price, exit_stake,"
                     " close_pending_since, close_loss_cut, COALESCE(channel, '')")
 RECENTLY_CLOSED = timedelta(hours=3)  # repeated "Bookset done 🥳" messages within this time are ignored
+LADDER_COLUMNS = ("id, created_at, channel, team, event, start_at, message_id, COALESCE(other, ''), first_price,"
+                  " last_step, stopped, ended_at, COALESCE(sport, 'cricket'), COALESCE(entries, 0), COALESCE(confirmed_by, ''),"
+                  " COALESCE(conflict, 0), COALESCE(peak, 0), COALESCE(was_favourite, 0), last_lay, last_back, team_back, last_pl,"
+                  " COALESCE(entry_prices, ''), COALESCE(end_reason, ''), COALESCE(waiting, 0)")
+NEW_LADDER_COLUMNS = {"sport": "TEXT DEFAULT 'cricket'", "entries": "INTEGER DEFAULT 0", "confirmed_by": "TEXT DEFAULT ''",
+                      "conflict": "INTEGER DEFAULT 0", "peak": "REAL DEFAULT 0", "was_favourite": "INTEGER DEFAULT 0",
+                      "last_lay": "REAL", "last_back": "REAL", "team_back": "REAL", "last_pl": "REAL",
+                      "entry_prices": "TEXT DEFAULT ''", "waiting": "INTEGER DEFAULT 0"}
+RECENT_LADDERS = timedelta(hours=24)  # a tipster's bookset can name a team whose steps ended this long ago
 
 # Statuses that count as a bet that exists. "unconfirmed" counts because the bet may be live.
 COUNTED = ("placed", "simulated", "unconfirmed")
@@ -130,13 +191,15 @@ def _matching(selection: str, names: list[str], loose_ok: list[bool] | None = No
 
 
 def period_start(period: str, now: datetime | None = None) -> datetime:
-    """Start of today / this week (Monday) / this month, local time."""
+    """Start of today / this week (Monday) / this month / this year, local time."""
     now = now or clock()
     day = datetime(now.year, now.month, now.day)
     if period == "week":
         return day - timedelta(days=day.weekday())
     if period == "month":
         return day.replace(day=1)
+    if period == "year":
+        return day.replace(month=1, day=1)
     return day
 
 
@@ -148,9 +211,53 @@ class Store:
         for column, kind in NEW_POSITION_COLUMNS.items():
             if column not in existing:
                 self._db.execute(f"ALTER TABLE positions ADD COLUMN {column} {kind}")
-        if "channel" not in {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}:
+        ladder_columns = {row[1] for row in self._db.execute("PRAGMA table_info(ladders)")}
+        for column, kind in NEW_LADDER_COLUMNS.items():
+            if column not in ladder_columns:
+                self._db.execute(f"ALTER TABLE ladders ADD COLUMN {column} {kind}")
+        message_columns = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
+        if "channel" not in message_columns:
             self._db.execute("ALTER TABLE messages ADD COLUMN channel TEXT DEFAULT ''")
+        for column in ("deleted_at", "edited_at", "edited_text"):
+            if column not in message_columns:
+                self._db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+        fancy_columns = {row[1] for row in self._db.execute("PRAGMA table_info(fancy)")}
+        for column, kind in (("site_name", "TEXT"), ("site_line", "REAL"), ("site_rate", "REAL"), ("site_pl", "REAL"),
+                             ("league", "TEXT")):
+            if column not in fancy_columns:
+                self._db.execute(f"ALTER TABLE fancy ADD COLUMN {column} {kind}")
         self._db.commit()
+
+    def mark_deleted(self, channel: str, tg_ids: list[int]) -> list[tuple[int, str, str]]:
+        """Records that the channel deleted these messages; returns (tg id, received at, text) of those the bot
+        had received (the latest copy of each id: ids are per chat, the channel name tells them apart)."""
+        found = []
+        for tg_id in tg_ids:
+            row = self._db.execute("SELECT id, received_at, text FROM messages WHERE channel = ? AND tg_id = ?"
+                                   " AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (channel, tg_id)).fetchone()
+            if row:
+                self._db.execute("UPDATE messages SET deleted_at = ? WHERE id = ?", (_now(), row[0]))
+                found.append((tg_id, row[1], row[2] or ""))
+        self._db.commit()
+        return found
+
+    def mark_edited(self, channel: str, tg_id: int, text: str) -> str | None:
+        """The channel changed a message: the new words are kept beside the first ones, which are returned. None when
+        the words are the same (a button or a reaction count) or the bot never got the message."""
+        row = self._db.execute("SELECT id, text, edited_text FROM messages WHERE channel = ? AND tg_id = ?"
+                               " ORDER BY id DESC LIMIT 1", (channel, tg_id)).fetchone()
+        if row is None or text.strip() == (row[2] if row[2] is not None else row[1] or "").strip():
+            return None
+        self._db.execute("UPDATE messages SET edited_at = ?, edited_text = ? WHERE id = ?", (_now(), text, row[0]))
+        self._db.commit()
+        return row[1] or ""
+
+    def decisions_on(self, channel: str, tg_id: int) -> list[str]:
+        """What the bot did on that message: 'ENTRY simulated', ... (for the deletion alert)."""
+        rows = self._db.execute(
+            "SELECT b.action, b.status FROM bets b JOIN messages m ON b.message_id = m.id"
+            " WHERE m.channel = ? AND m.tg_id = ?", (channel, tg_id)).fetchall()
+        return [f"{action.upper()} {status}" for action, status in rows]
 
     def rows(self, sql: str, params: tuple = ()) -> list[tuple]:
         """Read-only query, for the review tools."""
@@ -224,15 +331,18 @@ class Store:
                          (round(total, 2), round(average, 4), position_id))
         self._db.commit()
 
-    def find_position(self, selection: str, mode: str, channel: str = "") -> Position | None:
+    def find_position(self, selection: str, mode: str, channel: str = "", strict: bool = False) -> Position | None:
         """Latest not-yet-cashed-out position on this selection opened within POSITION_WINDOW.
-        With no selection ('' or '?'), the latest open position (of that channel, when one is given)."""
+        With no selection ('' or '?'), the latest open position (of that channel, when one is given).
+        strict: only that channel's positions (paper trading keeps each channel's trades apart)."""
         since = (clock() - POSITION_WINDOW).isoformat(timespec="seconds")
         rows = self._db.execute(
             f"SELECT {POSITION_COLUMNS}"
             " FROM positions WHERE mode = ? AND opened_at >= ? AND COALESCE(closed, 0) = 0 ORDER BY id DESC",
             (mode, since),
         ).fetchall()
+        if strict and channel:
+            rows = [row for row in rows if row[13] == channel]
         if not selection.strip(" ?"):
             for row in rows:
                 if not channel or row[13] == channel:
@@ -271,13 +381,25 @@ class Store:
         ).fetchall()
         return [Position(*row) for row in rows]
 
-    def trade_in_match(self, selection: str, mode: str) -> Position | None:
+    def old_open_positions(self, mode: str) -> list[Position]:
+        """Trades still open after POSITION_WINDOW (a Test match runs for days): nothing watches them any more."""
+        since = (clock() - POSITION_WINDOW).isoformat(timespec="seconds")
+        rows = self._db.execute(
+            f"SELECT {POSITION_COLUMNS}"
+            " FROM positions WHERE mode = ? AND opened_at < ? AND COALESCE(closed, 0) = 0 ORDER BY id",
+            (mode, since),
+        ).fetchall()
+        return [Position(*row) for row in rows]
+
+    def trade_in_match(self, selection: str, mode: str, channel: str = "") -> Position | None:
         """An unclosed trade on ANOTHER runner of a match this player is in (Alcaraz, while the bot holds Sinner
-        in 'Jannik Sinner v Carlos Alcaraz'), from any channel. Trades are recorded under the site's match name,
-        which names both sides."""
+        in 'Jannik Sinner v Carlos Alcaraz'), from any channel (only that channel's, when one is given). Trades
+        are recorded under the site's match name, which names both sides."""
         if not selection.strip(" ?"):
             return None
         for pos in reversed(self.unclosed_positions(mode)):
+            if channel and pos.channel != channel:
+                continue
             if contains_player(selection, pos.event) and name_score(selection, pos.selection) < NAME_MATCH_MIN:
                 return pos
         return None
@@ -360,6 +482,178 @@ class Store:
                 r["unsettled_risk"] += stake * (price - 1) if side == "lay" and price else stake
         return list(out.values())
 
+    def results(self, mode: str, since: datetime, until: datetime = datetime.max) -> list[dict]:
+        """The trades opened in [since, until), for /report. A trade booked at exactly 0 is a void one (the ledger's hand
+        corrections), not a result. risk: what an unknown result can lose."""
+        rows = self._db.execute(
+            "SELECT COALESCE(channel, ''), sport, league, side, price, stake, closed, closed_pl, closed_how FROM positions"
+            " WHERE mode = ? AND opened_at >= ? AND opened_at < ? ORDER BY id",
+            (mode, since.isoformat(timespec="seconds"), until.isoformat(timespec="seconds"))).fetchall()
+        return [{"channel": channel, "sport": sport, "league": league, "stake": stake, "closed": closed, "pl": pl,
+                 "risk": stake * (price - 1) if side == "lay" and price else stake}
+                for channel, sport, league, side, price, stake, closed, pl, how in rows
+                if not (how == "booked" and pl == 0)]
+
+    def trades_without_league(self, mode: str, since: datetime) -> list[tuple]:
+        """(id, opened_at, sport, event) of the trades whose league isn't named yet."""
+        return self._db.execute("SELECT id, opened_at, sport, event FROM positions WHERE mode = ? AND opened_at >= ?"
+                                " AND league IS NULL ORDER BY id", (mode, since.isoformat(timespec="seconds"))).fetchall()
+
+    def set_league(self, position_id: int, league: str) -> None:
+        self._db.execute("UPDATE positions SET league = ? WHERE id = ?", (league, position_id))
+        self._db.commit()
+
+    def fancy_results(self, mode: str, since: datetime, until: datetime = datetime.max) -> list[dict]:
+        """The fancy tips given in [since, until), for /report: pl at the tip's line, site_pl at the site's (units)."""
+        rows = self._db.execute(
+            "SELECT COALESCE(channel, ''), kind, league, units, outcome, pl, site_pl FROM fancy WHERE mode = ? AND"
+            " created_at >= ? AND created_at < ? ORDER BY id",
+            (mode, since.isoformat(timespec="seconds"), until.isoformat(timespec="seconds"))).fetchall()
+        keys = ("channel", "kind", "league", "units", "outcome", "pl", "site_pl")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def fancy_without_league(self, mode: str, since: datetime) -> list[tuple]:
+        """(id, created_at, 'cricket', event) of the fancy tips whose league isn't named yet."""
+        return self._db.execute("SELECT id, created_at, 'cricket', event FROM fancy WHERE mode = ? AND created_at >= ?"
+                                " AND league IS NULL ORDER BY id", (mode, since.isoformat(timespec="seconds"))).fetchall()
+
+    def set_fancy_league(self, fancy_id: int, league: str) -> None:
+        self._db.execute("UPDATE fancy SET league = ? WHERE id = ?", (league, fancy_id))
+        self._db.commit()
+
+    def day_trades(self, mode: str, start: datetime, end: datetime) -> list[tuple]:
+        """(channel, selection, price, stake, closed, closed_pl, closed_how) of the trades opened in [start, end)."""
+        return self._db.execute(
+            "SELECT COALESCE(channel, ''), selection, price, stake, closed, closed_pl, closed_how FROM positions"
+            " WHERE mode = ? AND opened_at >= ? AND opened_at < ? ORDER BY id",
+            (mode, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))).fetchall()
+
+    def day_misses(self, mode: str, start: datetime, end: datetime) -> list[tuple]:
+        """(channel, description, reason) of the entries not followed in [start, end): skipped or failed."""
+        return self._db.execute(
+            "SELECT COALESCE(m.channel, ''), b.description, b.reason FROM bets b LEFT JOIN messages m"
+            " ON m.id = b.message_id WHERE b.mode = ? AND b.created_at >= ? AND b.created_at < ?"
+            " AND b.action = 'entry' AND b.status IN ('skipped', 'failed') ORDER BY b.id",
+            (mode, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))).fetchall()
+
+    def day_deleted(self, start: datetime, end: datetime) -> dict[str, tuple[int, int]]:
+        """channel -> (messages it deleted in [start, end), how many of them the bot had traded on)."""
+        rows = self._db.execute(
+            "SELECT m.channel, COUNT(DISTINCT m.id), COUNT(DISTINCT b.message_id) FROM messages m"
+            " LEFT JOIN bets b ON b.message_id = m.id AND b.status IN ('placed', 'simulated')"
+            " WHERE m.deleted_at >= ? AND m.deleted_at < ? GROUP BY m.channel",
+            (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))).fetchall()
+        return {channel: (n, traded) for channel, n, traded in rows}
+
+    def log_price(self, position_id: int, price: float) -> None:
+        self._db.execute("INSERT INTO price_log (position_id, at, price) VALUES (?,?,?)", (position_id, _now(), price))
+        self._db.commit()
+
+    def last_prices(self, position_id: int, count: int) -> list[float]:
+        return [row[0] for row in self._db.execute("SELECT price FROM price_log WHERE position_id = ? ORDER BY rowid DESC"
+                                                   " LIMIT ?", (position_id, count)).fetchall()]
+
+    def closed_results(self, mode: str, channels: list[str]) -> list[tuple[str, float]]:
+        """(closed at, result) of these channels' finished trades with a known result, oldest first."""
+        marks = ",".join("?" for _ in channels)
+        return self._db.execute(f"SELECT closed_at, closed_pl FROM positions WHERE mode = ? AND channel IN ({marks}) AND closed = 1"
+                                " AND closed_pl IS NOT NULL ORDER BY closed_at", (mode, *channels)).fetchall()
+
+    # --- SK Astro's method (tradebot/ladder.py) ------------------------------------------------------
+
+    def add_ladder(self, mode: str, channel: str, team: str, event: str, start_at: datetime, message_id: int | None,
+                   sport: str = "cricket") -> int:
+        cur = self._db.execute(
+            "INSERT INTO ladders (created_at, mode, channel, message_id, team, event, sport, start_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (_now(), mode, channel, message_id, team, event, sport, start_at.isoformat(timespec="seconds")))
+        self._db.commit()
+        return cur.lastrowid
+
+    def active_ladders(self, mode: str) -> list[Ladder]:
+        rows = self._db.execute(f"SELECT {LADDER_COLUMNS} FROM ladders WHERE mode = ? AND ended_at IS NULL ORDER BY id",
+                                (mode,)).fetchall()
+        return [Ladder(*row) for row in rows]
+
+    def recent_ladders(self, mode: str) -> list[Ladder]:
+        """Latest first, ended ones too."""
+        since = (clock() - RECENT_LADDERS).isoformat(timespec="seconds")
+        rows = self._db.execute(f"SELECT {LADDER_COLUMNS} FROM ladders WHERE mode = ? AND created_at >= ? ORDER BY id DESC",
+                                (mode, since)).fetchall()
+        return [Ladder(*row) for row in rows]
+
+    def update_ladder(self, ladder_id: int, **values) -> None:
+        names = ", ".join(f"{name} = ?" for name in values)
+        self._db.execute(f"UPDATE ladders SET {names} WHERE id = ?", (*values.values(), ladder_id))
+        self._db.commit()
+
+    def end_ladder(self, ladder_id: int, reason: str) -> None:
+        self.update_ladder(ladder_id, ended_at=_now(), end_reason=reason)
+
+    def add_jackpot_day(self, day: date, source: str) -> bool:
+        """False when the day was already known."""
+        cur = self._db.execute("INSERT OR IGNORE INTO jackpot_days (day, source, added_at) VALUES (?,?,?)",
+                               (day.isoformat(), source, _now()))
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def remove_jackpot_day(self, day: date) -> bool:
+        cur = self._db.execute("DELETE FROM jackpot_days WHERE day = ?", (day.isoformat(),))
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def jackpot_days(self) -> list[str]:
+        return [row[0] for row in self._db.execute("SELECT day FROM jackpot_days ORDER BY day")]
+
+    def is_jackpot_day(self, day: date) -> bool:
+        return self._db.execute("SELECT 1 FROM jackpot_days WHERE day = ?", (day.isoformat(),)).fetchone() is not None
+
+    def channel_days(self, mode: str, channel: str) -> dict[str, tuple[int, float]]:
+        """Per day a trade was opened: how many, and what the closed ones made."""
+        rows = self._db.execute(
+            "SELECT substr(opened_at, 1, 10), COUNT(*), COALESCE(SUM(closed_pl), 0) FROM positions"
+            " WHERE mode = ? AND COALESCE(channel, '') = ? GROUP BY 1", (mode, channel)).fetchall()
+        return {day: (count, pl) for day, count, pl in rows}
+
+    # --- fancy tips (paper) ------------------------------------------------------------------------
+
+    def add_fancy(self, mode: str, channel: str, message_id: int | None, event: str, team: str, kind: str,
+                  number: int, line: float, side: str, rate: float | None, units: float, site_name: str = "",
+                  site_line: float | None = None, site_rate: float | None = None) -> int:
+        cur = self._db.execute(
+            "INSERT INTO fancy (created_at, mode, channel, message_id, event, team, kind, number, line, side, rate,"
+            " units, site_name, site_line, site_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_now(), mode, channel, message_id, event, team, kind, number, line, side, rate, units, site_name,
+             site_line, site_rate))
+        self._db.commit()
+        return cur.lastrowid
+
+    def open_fancy(self, mode: str) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT id, created_at, channel, event, team, kind, number, line, side, rate, units, match_id, site_line,"
+            " site_rate FROM fancy WHERE mode = ? AND outcome IS NULL ORDER BY id", (mode,)).fetchall()
+        keys = ("id", "created_at", "channel", "event", "team", "kind", "number", "line", "side", "rate", "units",
+                "match_id", "site_line", "site_rate")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def set_fancy_match(self, fancy_id: int, match_id: int, event: str = "") -> None:
+        """The tip's Cricbuzz match, and that match's name when given (a tip often knows only one side of it)."""
+        self._db.execute("UPDATE fancy SET match_id = ?, event = COALESCE(NULLIF(?, ''), event) WHERE id = ?",
+                         (match_id, event, fancy_id))
+        self._db.commit()
+
+    def settle_fancy(self, fancy_id: int, outcome: str, pl: float, note: str, site_pl: float | None = None) -> None:
+        self._db.execute("UPDATE fancy SET outcome = ?, pl = ?, note = ?, settled_at = ?, site_pl = ? WHERE id = ?",
+                         (outcome, pl, note, _now(), site_pl, fancy_id))
+        self._db.commit()
+
+    def day_fancy(self, mode: str, start: datetime, end: datetime) -> list[tuple]:
+        """(channel, team, kind, number, line, side, outcome, pl, note, site_pl) of the fancy tips given in [start, end)."""
+        return self._db.execute(
+            "SELECT COALESCE(channel, ''), team, kind, number, line, side, outcome, pl, note, site_pl FROM fancy"
+            " WHERE mode = ? AND created_at >= ? AND created_at < ? ORDER BY id",
+            (mode, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))).fetchall()
+
     def unsettled(self, mode: str, limit: int = 20) -> list[Position]:
         """Trades whose match finished without a booking and whose result isn't recorded yet."""
         rows = self._db.execute(
@@ -409,10 +703,11 @@ class Store:
         ).fetchall()
         return [(row[0], row[1], BetSignal.model_validate_json(row[2]), row[3], row[4]) for row in rows]
 
-    def find_pending(self, selection: str, mode: str, action: str = "entry") -> int | None:
-        """Id of a pending instruction of this kind on this selection (any selection when none is named)."""
+    def find_pending(self, selection: str, mode: str, action: str = "entry", channel: str = "") -> int | None:
+        """Id of a pending instruction of this kind on this selection (any selection when none is named), of any
+        channel (only that channel's, when one is given)."""
         pending = [(pending_id, signal) for pending_id, _, signal, _, _ in self.pending_instructions(mode)
-                   if signal.action == action]
+                   if signal.action == action and (not channel or signal.channel == channel)]
         if not selection.strip(" ?"):
             return pending[0][0] if pending else None
         index = _matching(selection, [signal.selection for _, signal in pending],

@@ -7,6 +7,7 @@ NAME_MATCH_MIN = 80  # score (0-100) needed to treat two names as the same team/
 TYPO_MIN_LENGTH = 5  # only words this long may be misspelt ("nambia"); short ones must match exactly
 SAME_NAME_MIN = 70  # two readings of one message: 'beaz' / 'Baez' = 75, 'berriting' / 'Berrettini' = 74
 IGNORED_WORDS = {"v", "vs"}
+WOMEN = {"w", "women", "womens"}  # the site writes 'Melbourne Stars W', tips and the AI 'Stars W' / 'Stars Women'
 # Different teams whose names look like typos of each other ('india' / 'indies' = 91): never matched loosely.
 CONFUSABLE = {frozenset(pair) for pair in (("india", "indies"), ("austria", "australia"), ("ireland", "iceland"))}
 
@@ -38,12 +39,17 @@ def typo_score(a: str, b: str) -> float:
 def contains_player(selection: str, listed: str) -> bool:
     """True if the listed match name includes the player/team being bet on, judged by the last word of
     the selection (surname, or 'Indies' / 'Africa' / 'USA'), exactly or with a small typo in long words.
-    Stops a tip on Safiullin from opening 'Cerundolo v Mensik' just because the opponent matches."""
+    Stops a tip on Safiullin from opening 'Cerundolo v Mensik' just because the opponent matches.
+    A women's team ('Stars W', 'Adelaide Strikers Women') is judged by the word before that, in a women's match."""
     words = _words(selection)
     if not words:
         return False
-    key = words[-1]
     listed_words = _words(listed)
+    if len(words) >= 2 and words[-1] in WOMEN:
+        if not WOMEN.intersection(listed_words):
+            return False
+        words = words[:-1]
+    key = words[-1]
     if key in listed_words:
         return True
     return len(key) >= TYPO_MIN_LENGTH and any(fuzz.ratio(key, w) >= NAME_MATCH_MIN and not _confusable(key, w)

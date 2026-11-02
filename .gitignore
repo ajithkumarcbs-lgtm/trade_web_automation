@@ -130,6 +130,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.backup
 .venv
 # Your followed Telegram chats (copy channels.example.json)
 channels.json
@@ -137,6 +138,10 @@ channels.json
 # Bot runtime data: Telegram session, browser profile, database, screenshots, sample messages
 data/
 samples/
+# WhatsApp login of tools/whatsapp_history: never commit it
+tools/whatsapp_history/.wwebjs_auth/
+tools/whatsapp_history/.wwebjs_cache/
+tools/whatsapp_history/node_modules/
 env/
 venv/
 ENV/

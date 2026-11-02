@@ -32,7 +32,7 @@ def day_data(db, day: date, mode: str) -> dict:
     """{channel: {"messages": [...], "bets": [...], "opened": [...], "closed": [...]}} for one day."""
     start, end = _day_bounds(day)
     out: dict = defaultdict(lambda: {"messages": [], "bets": [], "opened": [], "closed": []})
-    for row in db.rows("SELECT id, received_at, text, summary, COALESCE(channel, '') FROM messages"
+    for row in db.rows("SELECT id, received_at, text, summary, COALESCE(channel, ''), deleted_at FROM messages"
                           " WHERE received_at >= ? AND received_at < ? ORDER BY id", (start, end)):
         out[row[4] or "?"]["messages"].append(row)
     for row in db.rows("SELECT b.created_at, b.action, b.status, b.reason, b.description, b.price, b.stake,"
@@ -89,8 +89,14 @@ def review(store_path: Path, day: date, mode: str) -> None:
         check = [m for m in d["messages"] if m[0] not in decided and TIP_WORDS.search(m[2] or "")]
         if check:
             print(f"  check by hand ({len(check)} messages with tip words, no decision):")
-            for _, received, text, summary, _ in check[:15]:
+            for _, received, text, summary, _, _ in check[:15]:
                 print(f"    {received[11:16]} {text[:70]!r:72} -> {summary[:60]}")
+        gone = [m for m in d["messages"] if m[5]]
+        if gone:
+            print(f"  DELETED by the channel ({len(gone)}), the bot's decision on each above:")
+            for msg_id, received, text, _, _, deleted in gone:
+                acted = " [bot acted on it]" if msg_id in decided else ""
+                print(f"    {received[11:16]} (deleted {deleted[11:16]}) {(text or '(media)')[:80]!r}{acted}")
     still_open = db.rows("SELECT selection, price, stake, COALESCE(channel, ''), opened_at FROM positions"
                          " WHERE mode = ? AND COALESCE(closed, 0) = 0 ORDER BY id", (mode,))
     if still_open:

@@ -1,11 +1,13 @@
 {
-  "_comment": "Copy to channels.json (git-ignored) and edit. ids: from `python -m tools.telegram_setup`; a channel keeps its id when renamed. title_regex: chats you join later whose title matches are followed too (the tipster's next tournament channel). settings: .env settings that differ for this channel's trades. auto_bookset_units is a safety net for a bookset message that never comes, so it sits above the tipster's usual booking: on the SS ledger (Sep-Oct 2026) +1 unit would have cut its +22.8 units to +0.1, +3 units to +18.3.",
+  "_comment": "Copy to channels.json (git-ignored) and edit. ids: from `python -m tools.telegram_setup`; a channel keeps its id when renamed. title_regex: chats you join later whose title matches are followed too (the tipster's next tournament channel). settings: .env settings that differ for this channel's trades. auto_bookset_units (0 = off: trades close only when the tipster says so, or settle at the result) is a safety net for a bookset message that never comes, so if used it sits above the tipster's usual booking: on the SS ledger (Sep-Oct 2026) +1 unit would have cut its +22.8 units to +0.1, +3 units to +18.3.",
 
   "profiles": {
     "tipster": {
+      "paper_only": true,
       "rules": "tipster",
+      "ai_filter": true,
       "hint": "Tennis trading. Entries: 'Back <player> <odds> odds <units> unit' (often a screenshot caption; the screenshot shows the live price). Exits: 'Bookset' / 'book pannuga' = close now; 'Loss cut 2.5 la' = close now. Nicknames: 'goat' / '🐐' / 'Karupan' = Novak Djokovic. 'Thanks ra bubi' and result posts are not instructions.",
-      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 1.5},
+      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 0},
       "aliases": {"goat": "Novak Djokovic", "karupan": "Novak Djokovic"},
       "entry_words": "\\b(back|lay|entry|take|taken|try|edunga|podunga|ponga)\\b",
       "small_units": 0.5,
@@ -19,18 +21,31 @@
     },
 
     "ss": {
+      "paper_only": true,
       "rules": "ss",
+      "ai_filter": true,
+      "fancy_paper": true,
       "voice": true,
-      "hint": "Cricket jackpot trading (tennis sometimes). Entries: '<odds> odds back <team>' or '<team> back <odds> odds', the stake usually in the NEXT message: 'Limit 1', 'Limit 1.5 use', 'Only one limit', 'Half limit'. In this channel 'Losscut' / 'Losscut now' means close the trade NOW (it may be in profit): close with loss_cut true. 'Bookset', 'Now bookset', 'Good profit means bookset' = close now. 'Bookset coming', 'Be active', 'Ready for bookset' = not yet. '<team> win or low odds coming', 'Wait for my entry', zone lists ('1 to 4 over X zone') and '<a> odds to <b> odds jackpot done' are not instructions. 'Taken back <team>' / 'Taken back <team> now' = an entry on that team. 'Open rate back 6.4 odds' = an entry at the opening price. 'Try small amount', 'Try 200 or 300' right after an entry = its stake. Results and price updates ('1.66 fav ban', 'Wi 1.26 fire', 'my side non cutting done', 'Loss 1.5 limit only', 'Small amount i try 4.4k done ✅' — 'done ✅' or a profit amount means a result) are not instructions. Team codes: rno, tus, lim, grb, eci, war, wp, kg, lio, nwd, dol, lmp, mls, hob, ads, vic, sa e (South Africa Emerging).",
+      "act_on_voice": true,
+      "jackpot_days_only": true,
+      "hint": "Cricket jackpot trading (tennis sometimes). Entries: '<odds> odds back <team>' or '<team> back <odds> odds', the stake usually in the NEXT message: 'Limit 1', 'Limit 1.5 use', 'Only one limit', 'Half limit'. In this channel 'Losscut' / 'Losscut now' means close the trade NOW (it may be in profit): close with loss_cut true. 'Bookset', 'Now bookset', 'Good profit means bookset' = close now. 'Bookset coming', 'Be active', 'Ready for bookset' = not yet. '<team> win or low odds coming', 'Wait for my entry', zone lists ('1 to 4 over X zone') and '<a> odds to <b> odds jackpot done' are not instructions. 'Taken back <team>' / 'Taken back <team> now' = an entry on that team. 'Open rate back 6.4 odds' = an entry at the opening price. 'Try small amount', 'Try 200 or 300' right after an entry = its stake. 'Add one more 1 limit' = add 1 unit to the open trade. '4.4 odds back ind green money only 10% or 15% try' = entry with green_pct, the smaller percentage (10). 'Again bookset' = close the trade booked before and entered again (name that team). Results and price updates ('1.66 fav ban', 'Wi 1.26 fire', 'my side non cutting done', 'Loss 1.5 limit only', 'Small amount i try 4.4k done ✅' — 'done ✅' or a profit amount means a result) are not instructions. Team codes: rno, tus, lim, grb, eci, war, wp, kg, lio, nwd, dol, lmp, mls, hob, ads, vic, sa e (South Africa Emerging).",
       "aliases": {
         "rno": "Rhinos", "tus": "Tuskers", "lim": "Limpopo", "grb": "Garden Route Badgers",
         "eci": "Eastern Cape Iinyathi", "war": "Warriors", "wp": "Western Province", "kg": "Knights",
         "lio": "Lions", "nwd": "North West Dragons", "dol": "Dolphins", "rock": "Rocks", "lmp": "Limpopo",
-        "hob": "Hobart Hurricanes", "ads": "Adelaide Strikers", "vic": "Victoria", "sa e": "South Africa Emerging"
+        "hob": "Hobart Hurricanes", "hh": "Hobart Hurricanes", "ads": "Adelaide Strikers", "vic": "Victoria",
+        "bh": "Brisbane Heat", "sys": "Sydney Sixers", "sty": "Sydney Thunder", "syt": "Sydney Thunder",
+        "mlr": "Melbourne Renegades", "mls": "Melbourne Stars", "star": "Melbourne Stars",
+        "per": "Perth Scorchers", "pth": "Perth Scorchers", "sa e": "South Africa Emerging",
+        "waca": "Western Australia", "wa": "Western Australia", "nsw": "New South Wales", "qld": "Queensland",
+        "tas": "Tasmania", "saus": "South Australia",
+        "pkr": "Pokhara", "pk": "Pokhara", "srp": "Sudurpaschim", "bk": "Biratnagar", "jb": "Janakpur",
+        "ky": "Karnali", "ktm": "Kathmandu", "chr": "Chitwan", "lmb": "Lumbini"
       },
-      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 3.0},
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 0},
       "small_units": 0.5,
-      "green_money": "skip",
+      "rupees_per_unit": 1500,
+      "green_money": "stake",
       "entry_words": "\\b(back|lay|entry|entries|take|try|edunga|podunga|ponga|khao|lagao)\\b",
       "stake_wait_s": 45,
       "limit_followup_s": 180,
@@ -39,11 +54,146 @@
 
     "tennistv": {
       "rules": "tennistv",
-      "hint": "Tennis in-play tips in Hindi. Entry: '<PLAYER> Win Karo' with '<a> limit use kro <b> limit rhega <PLAYER> pr' = back PLAYER with a units, odds 1 + b/a (the screenshot shows the live price and the full name). 'HALF LIMIT EXTRA' = add. Close now: 'Cashout done x - x limit', 'Bookset lifeset', 'Cashout karlo'. Not a close: 'Cashout khudse kr lena' (cash out yourself), 'Entry kr lena sabhi log cashout khudse krna'. Worksheets ('PASS', 'X/Y'), member testimonials, paribook247 ads, abuse and 'paid group' posts are not instructions.",
-      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 3.0},
+      "ai_filter": true,
+      "hint": "Tennis in-play tips in Hindi. Entry: '<PLAYER> Win Karo' with '<a> limit use kro <b> limit rhega <PLAYER> pr' = back PLAYER with a units, odds 1 + b/a (the screenshot shows the live price and the full name). Prices in paise: '35P entry kr lena' = enter at odds 1.35, '15 paise' = 1.15. 'HALF LIMIT EXTRA' = add 0.5 units. 'SKIP KRDO <PLAYER>' after an entry on that player = cancel it: close that trade now (loss_cut true). 'WAIT KRKE ENTRY KRNA' = not an instruction. Close now: 'Cashout done x - x limit', 'Bookset lifeset', 'Cashout karlo'. Not a close: 'Cashout khudse kr lena' (cash out yourself), 'Entry kr lena sabhi log cashout khudse krna'. Worksheets ('PASS', 'X/Y'), member testimonials, paribook247 ads, abuse and 'paid group' posts are not instructions.",
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 0},
       "act_on_forwards": false,
       "entry_words": "\\b(win karo|back|entry|khao|lagao)\\b",
       "confirm": {"disagree": true, "below_confidence": 0.85, "above_units": 2, "no_odds": true}
+    },
+
+    "tennistv_watch": {
+      "trade": false
+    },
+
+    "kartik": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "hint": "Cricket match-winner trading in Hindi. Prices in paise: '68P' = odds 1.68, '98P' = 0.98 -> 1.98, '18P' = 1.18. 'Khao' = eat the favourite = LAY it. Entry: '<price>P - <TEAM> Khaoooo' = side lay, selection TEAM, at that price, 1 unit. '60P TORONTO KHAOO / MONTREAL PLUS KRO' = one signal: lay Toronto. '2nd Entry Lo' / '3rd Entry Lo' + '<price>P - <TEAM> Khaoooo' = action add, side lay, at the new price (never a close). The card 'Match Winner :- <A> / <B> Favourite Par Khao / <A> Plus Karna Hai' is his prediction, no signal: the entry is the price line after it. '<TEAM> HI JEETEGA', 'RATE AYEGA TO ENTRY KRENGE', 'India Nhi Jitegi' = prediction, no signal. Close now: 'BOOKSET KRLO', '<a>P <TEAM> TO APNI TEAM <b>P CASHOUT KRLO', '... LOSSCUT BOOKSET KRLENA' (loss_cut true). Results ('PASS', 'NON-CUTTING PASS', 'JACKPOT', 'WORKSHEET', 'WON THE MATCH'), 'SUNLENA SAB', VIP / UPI / paid group posts are not instructions.",
+      "entry_words": "(khao+|lagao|back|entry|entries)",
+      "act_on_forwards": false,
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 0}
+    },
+
+    "sudheer": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "hint": "Tennis tips in Telugu/English. Entry: 'Running Tennis Match / <PLAYER> Winner / Take Entries' = back PLAYER now at the price on offer, 1 unit (no odds given). '<n>P OPP TAKE ENTRIES' = enter now (the opponent is at 1.<n>) on the player of the last tip. 'BE ACTIVE', 'READY NA' are not instructions. Close now: 'Bookset', 'Cashout', 'Book profit'. Worksheets ('TODAY TENNIS WORK SHEET', 'X/Y PASS'), 'CHAMPION', South111 / APK / deposit / profit-share posts are not instructions.",
+      "entry_words": "(take entr|winner|back|entry|entries)",
+      "act_on_forwards": false,
+      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 0}
+    },
+
+    "raftaar": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "hint": "Tennis tips in Hindi. Entry: 'WINNER - <PLAYER>' names the player; 'SINGLE LIMIT SE KHAO' = 1 unit, 'DOUBLE LIMIT' = 2 units; '<n> PAISE KHAO' with no name = back the player of the last WINNER line, odds null (1.<n> is the opponent's price: he is the favourite being eaten). Close now: '<a> P KHILAAF SE / <b> P HUM / BOOK SET / CASH OUT'. Results ('HAAR GYA', 'WIN THA', 'WAIT FOR NEXT', 'UD GAYA BOOKIE'), '100% SURE MATCH', id / site / audio promos are not instructions.",
+      "entry_words": "(khao|winner|entry)",
+      "act_on_forwards": false,
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 0}
+    },
+
+    "winkaro": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "hint": "Hindi tennis (sometimes cricket) tips. Entry: '<PLAYER> Win Karo' / 'Win Kro' / '#<PLAYER> WIN KARO' / 'WINNER - <PLAYER>' / 'Running Tennis Match / <PLAYER> PLUS KARO' = back PLAYER now, 1 unit unless '<n> limit se' / 'double limit' gives the units. '<n>p <X> FAV KHAOOO / <Y> WIN KRO', '<n>P <X> KHAO / <Y> PLUS KARO', 'Winner - <Y> / <n>P <X> Khao' = one signal: back Y (X is the favourite at 1.<n>), never a back of X. '<n>P LAY KARO <PLAYER>' = lay PLAYER at 1.<n>. Prices in paise: '30p' = odds 1.30. 'Bookset At Low Odds Compulsory' / 'BOOK SET COMPULSORY' inside an entry message is advice, not a close. Close now: 'Bookset', 'Book set karo', 'Cash out kar lo (<n>p pr)', 'Cashout karo', '<a>p entry se apni player <b>p fav, cashout karo', 'LOSS CUT BOOK SET' (loss_cut true). Not instructions: results ('WON NON CUTTING', 'PASS', 'JACKPOT MUBARAK', 'GHODA UDA DIYA', 'MY WORK COMPLETE', worksheets), 'Match Winner' predictions with no Win Karo / Plus Karo / Khao, reactions requests, profit-sharing / package / ID / site / APK promos.",
+      "entry_words": "(win karo|win kro|winner|khao|lay karo|entry|back)",
+      "act_on_forwards": false,
+      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 0}
+    },
+
+    "bossfire": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "fancy_paper": true,
+      "hint": "Cricket session (fancy) calls in Hindi; no match-odds tips. '<n> OVER <line> YES <TEAM>' = fancy, side yes, selection '<n> Over Runs <TEAM>', line <line>: the number before OVER is the over, the one after it the line ('10 OVER 102 YES NZ' = over 10, line 102). '<n> OVER <line> NOT <TEAM>' = the same with side no. The row of ✔️✔️✔️ under a YES call and of ❌❌❌ under a NOT call is decoration of the call itself, never a result: '20 OVER 164 NOT AFG MEN ❌❌❌' is a no call on 20 Over Runs AFG at 164. '<n>st/nd/th WICKET CALL' with '<line> K UNDER JAYEGA' = fancy, side no, selection '<n> Wkt <TEAM batting now, from the context>', line <line>; 'UPAR JAYEGA' = side yes. 'NORMAL LIMIT' = 1 unit, 'HALF LIMIT' = 0.5, 'DOUBLE LIMIT' = 2. Not instructions: 'SESSION PASS', 'BOOM', 'FAIL', any line with the word Pass ('10 Over 80 Yes Pass ✔️✔️', '20 Over 179 Not Pass ✔️✔️': a result), 'WORKSHEET' lists, day summaries ('14 OCTOBER SESSION ... Pass'), 'Wait kro', reaction requests, toss / match predictions, promos.",
+      "entry_words": "(over|wicket|wkt|yes|not|under|upar)",
+      "act_on_forwards": false
+    },
+
+    "panther": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "fancy_paper": true,
+      "small_units": 0.1,
+      "hint": "Panther Cricket Analyst, cricket calls in English and some Telugu: match entries, fancy and player lines. Match entry, market match_odds, side back: 'Back #SYT @ 2.10 odds', 'Plus on #AFG 2.10 ODDS WITH 1X LIMIT', 'Back Straight TAS @ 1.90 ODDS', 'MLR-W 90 odds Fav / Use 1x Limit & Take entry on #SYT / Back SYT-w @ 2.10 odds' (one signal on SYT: the team at '90 odds fav' is the other side), 'Backing Perth Straight Now / Using 4 Limits / Back #PRS @ 1.60', 'Back Draw @ 2.7' (selection The Draw). More on a team already entered, action add: 'Another 1 limit on #PAK / Backing @ 5.00 odds', 'Use Another Single Limit here / Back IND @ 4.7', 'Use another Small Limit on #Titans'. The card '🆘 A 🆚 B / OUR WINNER / #TEAM / BOOKSET: 35 ODDS / Wait For Entries' is a prediction: no signal, as are 'Match winner #AFG, if Afg comes non favs we take entries', 'Keep Two small Limits for This Match', 'Wait for Entries', 'As of now No entries', 'SKIPPING THIS MATCH'. Close now, with the team as selection: 'Make Bookset', 'BOOKSET HERE', 'BOOKSET NOW INDIA 35 ODDS', 'OUR TEAM #SYT 29-30 ODDS FAV / Make Bookset Every one', '37-39 NEW ZEALAND / Make Bookset Every One', 'Those who taken Make a Bookset', 'If u missed bookset / Now Exit Here'. Not yet: 'Dont Forgot too Make Bookset If Titans Gets 40 Odds', 'If we Get 287 , 290 will exit'. Limits: 1x limit, single limit, normal limit = 1 unit; 2x limit = 2; 'Using 4 Limits' = 4; small limit, very small limit = 0.1; '10% limit' = 0.1, '5% limit' = 0.05, '50% limit' = 0.5; none stated: units null. Fancy, market fancy, side yes, or no for 'NOT', 'NO', 'under': '<TEAM> 20 Overs 192 Yes', '➡️ 20 Overs NZ 193 - NOT' = selection '20 Over Runs <TEAM>', line the number. A team and a total with no over ('Pakistan 287 YES', 'Bangladesh 274 Yes', '#ENG 321 YES', 'Eng under 313', 'NAMIBIA = 224 LAMBI YES') = market_name 'Lambi <TEAM>', selection the team, line the total. A player: 'M Penna 23 RUNS YES', 'Annabel Sutherland Runs 22 Yes', 'D singh Aree 24 Runs Yes' = market_name 'Player Runs', selection the player as written, line the runs; 'Connolly 35 Balls Yes', 'HMB = 36 BALLS YES' = market_name 'Player Balls'. Event: the match of the latest card or team in the context, as '<A> v <B>', else '? v ?'. A new line on the last fancy call gives only its number: '290 Now Take', '143 Now / 2x Limit', '168 Yes / Same Limit', '30 Runs also Yes but small Limit', '24 take' = the same selection and side at the new line, with the limit it states or the last call's for 'Same Limit'. 'Taken 23' only says the line he got: no signal. Other sessions ('25 Fours', '6th wicket Balls 130 Yes', 'Total match boundaries 43', '1st 3 wickets 78') = market other. No signal: 'Pingo Fancy Pass', 'Match Pass', 'Loss', 'Lost this', 'Fail', 'Exit' with no team in a fancy, worksheets, 'Active', 'Active For Titans Match Fancy', comments on a game, good morning and good night, requests for reactions, polls, Tarzon365 and other site, bonus or withdrawal promos, toss channel links. Team codes, with w or -W at the end for the women's side: SYT Sydney Thunder, SS and SYS Sydney Sixers, MLS and MS Melbourne Stars, MLR Melbourne Renegades, ADS Adelaide Strikers, PRS Perth Scorchers, HBH and HH Hobart Hurricanes, BH Brisbane Heat, TIT Titans.",
+      "aliases": {
+        "syt": "Sydney Thunder", "ss": "Sydney Sixers", "sys": "Sydney Sixers", "mls": "Melbourne Stars", "ms": "Melbourne Stars",
+        "mlr": "Melbourne Renegades", "ads": "Adelaide Strikers", "prs": "Perth Scorchers", "hbh": "Hobart Hurricanes",
+        "hh": "Hobart Hurricanes", "bh": "Brisbane Heat", "tit": "Titans", "tas": "Tasmania"
+      },
+      "entry_words": "(back|plus on|yes|\\bnot\\b|\\bno\\b|under|take|runs?|balls?|limit|overs?|lambi)",
+      "act_on_forwards": false,
+      "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 0}
+    },
+
+    "panther_toss": {
+      "paper_only": true,
+      "rules": "panther_toss",
+      "rules_only": true,
+      "fancy_paper": true,
+      "act_on_forwards": false
+    },
+
+    "skastro": {
+      "rules": "sk",
+      "rules_first": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "hint": "Astrology-based cricket picks (English, some Tamil). Entry = back the team now, 1 unit, at the price on offer: '<TEAM> win or Bookset', '<TEAM> win or Even', '<A> vs <B> / <TEAM> even' or 'Eng even' (the team will reach even odds: back it), 'Match 🏆 <TEAM>', '<TEAM> 70%' (a team with a percentage), 'Fav - <TEAM>', '<TEAM> Toss or Match Win' (market match_odds), and fixture lines '<n>. <A> vs <B> - <TEAM>' (TEAM is the pick; one entry per line). Close now (only for a trade on that team): 'Bookset', '<TEAM> bookset', 'Now bookset', 'If Enter Bookset', 'Losscut', 'If rate gets exit', 'Even ✅'. Not instructions: 'Jackpot Alert' / 'Jackpot Days' naming no team, timing lines ('7.30 to 7.45 TGC 40%'), toss calls ('Toss Winner will be Match Winner'), 'Skip', 'Risky', 'Both side trade', results ('12p Jackpot ✅', '<TEAM> Win ✅', '❌', summaries, 'Done ✅', 'SL 50p to 50p ✅', '1p to Even', a list like 'Today / Ads Win ✅ / UAE Win ✅ / SL Even ✅ & bookset'), player flop / wicket timing notes, protrader247 / website / YouTube / poll posts.",
+      "entry_words": "(win or|even|🏆|%|fav|vs|toss or)",
+      "enter_before_start_min": 10,
+      "ladder": true,
+      "ladder_rules": {"profit_target": 1.0, "equal_band": 0.10, "giveback": 0.2, "daily_loss": 3.0, "max_open": 3, "max_drawdown": 10.0, "cooldown_min": 30},
+      "jackpot_source": true,
+      "act_on_forwards": false,
+      "settings": {"odds_tolerance": 0.20, "auto_bookset_units": 0}
+    },
+
+    "cricstatz": {
+      "paper_only": true,
+      "ai_filter": true,
+      "bare_photos": false,
+      "act_on_forwards": false,
+      "hint": "English tips from The Cricket Betting Podcast (tipsters EH, PK, RM), mostly on UK bookmakers. Write all prices as decimal odds: 9/2 = 5.5, 5/6 = 1.83, 11/10 = 2.1, Evs = 2. Stakes: '2pts', '1.5pt', '2u' = units; no stake given = units null. Betfair Exchange orders ('IN-PLAY TEST SYSTEM', 'TEST TRADING SYSTEM', 'Place following orders', 'Keep in play') are limit orders: one signal per line ('Back South Africa 2pts @ 3.0', 'Back Pakistan 1.35pt 4.1', '2pts Australia @ 2.4'): action entry, sport cricket, market match_odds, side back, selection the team, units, odds and when_odds both the price, event from the match line or the two teams named. A line naming a team that isn't in the match line ('Bangladesh v West Indies / Back Australia') is a slip: use the match line's team not yet named. 'Back <team> to win 1pt @ 2.28 (Betfair Exchange)' = entry, market match_odds, odds 2.28, when_odds null. Every other tip ('TIP (PK)', 'TIPS (EH)', 'BEST BETS'): top batter, top bowler, most sixes, total match runs, over/under, fifties, man of the match, outright, when the match finishes: one signal per selection, action entry, sport cricket, market other, market_name the market ('Top New Zealand batsman'), selection the player or line ('Daryl Mitchell', 'Over 903.5'), side back, odds, units. Not instructions: BetWright boosts and accas, free-bet and sign-up offers, podcast links, VIP / tracker / monthly reviews, results and recaps, 'system does not apply' notes, NFL / NBA / golf, Dream11.",
+      "entry_words": "(\\bback\\b|\\btips?\\b|\\bpts?\\b|\\border|\\d+/\\d+)",
+      "settings": {"auto_bookset_units": 0, "conditional_entry_min": 7200, "both_sides_in_match": true}
+    },
+
+    "my_tips": {
+      "rules": "mine",
+      "rules_only": true,
+      "ladder": true,
+      "ladder_rules": {"profit_target": 1.0, "equal_band": 0.10, "giveback": 0.2, "daily_loss": 3.0, "max_open": 3, "max_drawdown": 10.0, "cooldown_min": 30},
+      "enter_before_start_min": 10,
+      "hint": "The owner's own calls, cricket or tennis. '<TEAM> win', '<TEAM> match win', '<TEAM> even or win', 'IND vs NZ / India win', 'India win 3 limit' = entry, back that team, market match_odds. 'Bookset', 'Losscut', 'Loss cut', '<TEAM> bookset' = close now. Anything else is no signal.",
+      "settings": {"odds_tolerance": 0.20, "auto_bookset_units": 0}
+    },
+
+    "wa_tamil_sports": {
+      "paper_only": true,
+      "pasted": true,
+      "fancy_paper": true,
+      "green_money": "stake",
+      "hint": "A sports trader's own live entries in English, pasted from WhatsApp. Stakes are a share of one unit: '50% stake' = 0.5 units, '30%' = 0.3. Entry: 'Backed <TEAM> 30% stake @2.74', 'BACKED NZ @2.54 50% STAKE', 'BACKED INDIA 3.05 50%' = back TEAM at that price. 'Moved Green and keep 50% Stake On <TEAM>' = back TEAM, 0.5 units. 'Backed <TEAM> with Another 50% @2.78', 'Backed another 50% @2.96', 'Back another 50% stake @4' = action add on the latest team at that price. 'Shift the green to <TEAM> @2.08', 'Shifting green to <TEAM>' = entry, back TEAM at that price, green_pct 100 (a price on the next line belongs to it). Close now: 'Loss cut', 'Loss cut @1.74 NZ' (loss_cut true; the team named is where the price is, the trade closed is the latest one). Session: '6 overs 35 Runs yes' = fancy, side yes, selection '6 Over Runs <TEAM batting now, from the context>', line 35; units from '50% stake' in that message. Player runs like 'Charlie Knot 19 Runs NO', 'Grace Harris 41 Runs No' = market other. No signal: 'Taking 2 limit entry on <game>' (no side), 'Be active', 'Eye on <game>', 'Playing <games>', a '50% stake' line alone, 'BOOOM', ✅, greetings, comments on a game, exchange-ID offers.",
+      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 0}
+    },
+
+    "wa_david": {
+      "paper_only": true,
+      "rules": "david",
+      "pasted": true,
+      "entry_words": "(lay|limit|plus)",
+      "aliases": {"hobartw": "Hobart Hurricanes Women", "sixersw": "Sydney Sixers Women", "thunderw": "Sydney Thunder Women",
+                  "adelaidew": "Adelaide Strikers Women", "brisbanew": "Brisbane Heat Women", "perthw": "Perth Scorchers Women"},
+      "hint": "A cricket tipster in English, pasted from a WhatsApp group. Prices in paise: '59' or '50p' = odds 1.59, 1.50. Stakes are a share of one unit: 'Lay-60%', 'Use 60% limit' = 0.6 units. Entry: '59 india / Lay-60% / NEWZLEAND plus' = one signal, side lay, selection India, odds 1.59, 0.6 units. 'WBBL / Hobartw -50p / Use 60% limit / Sixers plus' = one signal, side lay, selection Hobart Hurricanes Women, odds 1.50, 0.6 units. Close now: 'Loss cut only', 'Now loss cut' (loss_cut true). No signal: '<A> VS <B> / <TEAM> WIN OR 37P' (his call before the entry), 'Wait no ball', requests for reactions, chat.",
+      "settings": {"odds_tolerance": 0.15, "auto_bookset_units": 0}
     },
 
     "strict": {
@@ -51,28 +201,42 @@
     }
   },
 
+  "_removed_2026_11_01": [
+    {"name": "Tennis Tips King", "profile": "winkaro", "ids": [-1002682744849], "why": "paper test 8W 14L, -9118 in 6 days"},
+    {"name": "Sudheer", "profile": "sudheer", "ids": [-1002342284801], "why": "paper test 7W 9L, -7532 in 6 days"},
+    {"name": "Tennis King Free", "profile": "winkaro", "ids": [-1001279429607], "why": "1 trade in 6 days, -1000"},
+    {"name": "Tipster VIP", "profile": "tipster", "ids": [-1004436642179, -1004381834310], "title_regex": "^(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)\\b", "why": "0 messages in 6 days"},
+    {"name": "Tipster open group", "profile": "tipster_open", "ids": [-1001878026315], "why": "only watched for Tipster VIP's group links"},
+    {"name": "Tennis Tv", "profile": "tennistv_watch", "ids": [-1001509705209], "why": "watch only since 26 Oct: 5 of 16 tips won (-12 units in 5 days) and it deletes its losing tips"},
+    {"name": "Tennis Expert Tipster", "profile": "winkaro", "ids": [-1002093602124], "why": "the owner's list of 1 Nov left it out: 1W 1L, -818, most tips not on the site"},
+    {"name": "Tennis King", "profile": "winkaro", "ids": [-1001551518736], "why": "the owner's list of 1 Nov left it out: 0W 1L, -1000"},
+    {"name": "TAMIL SPORTS CENTER", "profile": "wa_tamil_sports", "ids": [-1004374707391], "title_regex": "^WA Tamil Sports", "why": "the owner's list of 1 Nov left it out: WhatsApp, pasted by hand, no live paste"},
+    {"name": "DAVID REPORTS 2", "profile": "wa_david", "ids": [-1003963275193], "title_regex": "^WA David Reports", "why": "the owner's list of 1 Nov left it out: WhatsApp, pasted by hand, no live paste"}
+  ],
   "channels": [
-    {
-      "name": "Tipster VIP",
-      "profile": "tipster",
-      "ids": [-1004436642179, -1004381834310],
-      "title_regex": "^(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)\\b"
-    },
-    {
-      "name": "Tipster open group",
-      "profile": "tipster_open",
-      "ids": [-1001878026315]
-    },
     {
       "name": "SS sports",
       "profile": "ss",
       "ids": [-1003769891853]
     },
     {
-      "name": "Tennis Tv",
-      "profile": "tennistv",
-      "ids": [-1001509705209]
+      "name": "Kartik Bhai",
+      "profile": "kartik",
+      "ids": [-1001726295543]
     },
+    {
+      "name": "Raftaar",
+      "profile": "raftaar",
+      "ids": [-1004333481060]
+    },
+    {"name": "Tennis Professor", "profile": "winkaro", "ids": [-1001347348870]},
+    {"name": "SK Astro", "profile": "skastro", "ids": [-1002353367477]},
+    {"name": "MY Tips", "profile": "my_tips", "ids": [], "title_regex": "^MY Tips",
+     "_comment": "the owner's own private Telegram channel: followed by its title; same steps as SK Astro"},
+    {"name": "Boss Fire 2.0", "profile": "bossfire", "ids": [-1002178762850]},
+    {"name": "CricStatz", "profile": "cricstatz", "ids": [-1002615442721]},
+    {"name": "Panther", "profile": "panther", "ids": [-1002294396193]},
+    {"name": "Panther Toss", "profile": "panther_toss", "ids": [-1003749997860]},
     {
       "name": "TEST group",
       "profile": "strict",

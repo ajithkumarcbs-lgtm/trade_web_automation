@@ -18,23 +18,31 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Awaitable
 
-from openai import APIConnectionError
+from openai import APIConnectionError, RateLimitError
 
 from tradebot.channels import MANUAL, Channel, Channels, apply_aliases
 from tradebot.config import DATA_DIR, SITE_FIELDS, TELEGRAM_FIELDS, Settings, load_settings
-from tradebot.exchange_bot import BetResult, ExchangeBot, _best_index
+from tradebot.exchange_bot import BetResult, ExchangeBot, TeamQuote, _best_index
+from tradebot.fancy import (PLAYER_KINDS, Cricbuzz, Match, Session, coming_match, finished_match, read_session, same_batter,
+                            team_fits)
+from tradebot.fancy import settle as settle_session
+from tradebot.ladder import (BOOKSET, EQUAL_EXIT, FELL_BACK, GIVEBACK, STEPS, WAIT_FAVOURITE, Ladder, LadderRules, exit_call,
+                             jackpot_days_in, parse_day, read_sk_tip)
+from tradebot.leagues import leagues_of, sport_of
 from tradebot.models import BetSignal, ParsedMessage, as_bet
-from tradebot.notifier import Notifier, bet_alert, confirm_request, match_finished, report_text, trade_summary
-from tradebot.risk import Decision, RiskManager, booked_profit
+from tradebot.notifier import (Notifier, bet_alert, confirm_request, day_report, match_finished, results_report,
+                               trade_summary)
+from tradebot.risk import Decision, RiskManager, booked_profit, other_runners_price
 from tradebot.names import contains_player, same_name
-from tradebot.rules import name_words, not_yet, parse_known, parse_strict, reconcile
+from tradebot.rules import fresh_part_of_paste, name_words, not_yet, parse_known, parse_strict, reconcile
 from tradebot.skyfair import is_skyfair
-from tradebot.signal_parser import CONTEXT_MESSAGES, CONTEXT_WINDOW, context_line, expand_team, make_parser
-from tradebot.store import COUNTED, Store, period_start
+from tradebot.signal_parser import CONTEXT_MESSAGES, CONTEXT_WINDOW, VOICE_HINT, context_line, expand_team, make_parser
+from tradebot import store as trade_log
+from tradebot.store import COUNTED, Position, Store, period_start
 from tradebot.telegram_listener import IncomingMessage, listen
 from tradebot.voice import Transcriber
 
@@ -42,22 +50,118 @@ log = logging.getLogger("tradebot")
 
 
 BOOKSET_RETRY_SECONDS = 10  # how often a refused bookset / loss cut is tried again
+TENNIS_SUSPENDED_MINUTES = 10  # a tennis entry whose market is suspended is retried this long (not ENTRY_RETRY_MINUTES)
+HELD_ENTRY_MINUTES = 40  # an entry held for its match is tried this long from its time (10 min before to 30 after the start)
+# A waiting entry allowed longer than this can wait for days (CricStatz's Test orders): its price is read SLOW_WAIT_EVERY,
+# not every 10 s, which would keep the browser busy for all that time.
+SLOW_WAIT_ABOVE_MIN = 180
+SLOW_WAIT_EVERY = timedelta(seconds=60)
+LONG_HOLD_POLL = timedelta(minutes=10)  # how often the results of trades held for days are looked for
 GREEN_MONEY_WITHIN = timedelta(hours=6)  # "green 20%" takes 20% of the channel's last bookset in this time
 GROUP_LINK = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)[\w-]+", re.IGNORECASE)
 SMALL_STAKE = re.compile(r"\b(?:small|chinna)\b", re.IGNORECASE)  # "try small amount"
+NOT_ENTERED = re.compile(r"\bentry\s+(?:nahi|nhi|nahin)\b", re.IGNORECASE)  # "50p h jiska entry nahi hua hai kar lo"
+AGAIN = re.compile(r"\bagain\b", re.IGNORECASE)  # "Again bookset": the trade entered again, not the newest one
+# Words (and prices) without which a text can't be an instruction of any channel followed: entries, stakes, closes
+AI_WORDS = re.compile(
+    r"\b(back|lay|khao+|lagao|lagaa|win|winner|entry|entries|entr|limit|limits|unit|units|odds|paise|\d+\s*p|"
+    r"book\W*set|bookset|cash\W*out|cashout|loss\W*cut|losscut|exit|skip|even|fav|favourite|favorite|take|taken|try|"
+    r"add|extra|half|double|single|green|small|stake|rs|cancel|plus|khelo|karo|kro|now)\b|\d\.\d|₹",
+    re.IGNORECASE)
+# A voice note a channel acts on goes to the AI only with one of these (about 2 in 5 of SS's), in English or Tamil letters
+VOICE_WORDS = re.compile(r"book\W*set|box\W*set|loss\W*cut|last\W*cut|cash\W*out|\bback\b|\bentry\b|\blimit\b|"
+                         r"புக்|லாஸ்|பேக்|பாக்க்|லிமிட்|என்ட்ரி", re.IGNORECASE)
+VOICE_MIN_CONFIDENCE = 0.85  # talk is looser than a typed tip
+# Only "book it now" acts from a voice note. On 16 of SS's old notes the AI alone gave 5 false closes, all of these:
+# a price or over still to come ("1.8 range-la bookset", "35-th over-la bookset") or "should / could" ("பண்ணனும்", "பண்ணலாம்").
+VOICE_CLOSE_NOW = re.compile(r"பண்ணிடுங்க|பணிடுங்க|பண்ணிக்கோங்க|பண்ணிகோங்க|பணிக்கோங்க|பணிகோங்க|பண்ணுங்க|"
+                             r"pann?unga|pann?ik+on?ga|pann?idunga", re.IGNORECASE)
+VOICE_NOT_NOW = re.compile(r"\d\.\d|ரேஞ்ச்|\brange\b|ஓவர்|\bovers?\b|வந்தா|அப்படின்னா|பண்ணனும்|பண்ணியனும்|பண்ணிக்கலாம்|"
+                           r"பண்ணலாம்|வரும்|ரெடி|\bready\b|\bwait\b|வெய்ட்", re.IGNORECASE)
 HELP = """🤖 *Commands* (send them here, in Saved Messages)
 /status: bot state, open trades, today's result
-/report [day|week|month]: P/L per channel
+/today, /yesterday: each channel's trades of the day, won / lost, missed tips, deleted messages
+/report [day|week|month|year]: limits per channel, cricket and tennis, league by league;
+/report 2026-10, /report 2026-10-29: the same for a past month or day
 /settle <trade id> win|lose|<amount>: result of a trade that ran to the end
 /pause, /resume: stop / allow new entries (bookings always work)
 /yes <n>, /no <n>: answer a CONFIRM question
 /channels: chats followed; /follow <chat id> <channel>; /unfollow <chat id>
 Trade by hand: /back Shelton 3.25 1u, /lay Sinner 1.55 0.5u, /back at Berrettini 3 1u,
-/exit Shelton 1.6, /bookset Shelton, /losscut Shelton, /cancel Berrettini"""
+/exit Shelton 1.6, /bookset Shelton, /losscut Shelton, /cancel Berrettini
+SK method: /sk shows each tip's state, odds, entries, P&L, bookset and stop; /sk UAE Toss or Match Win, /sk Sri Lanka Even
+or Win: a tip you got elsewhere, treated as SK's post, and it decides when SK and your channel disagree; /bookset UAE books
+it, /cancel UAE stops its entries
+SK jackpot days: /jackpot shows them and SS's result on them; /jackpot 5 Nov, /jackpot today, /jackpot off 5 Nov"""
 
 
 def _clock() -> str:
     return datetime.now().strftime("%d %b %H:%M:%S")
+
+
+def _date_range(text: str) -> tuple[datetime, datetime] | None:
+    """[start, end) of '2026', '2026-10' or '2026-10-29'. None if it isn't a date like these."""
+    found = REPORT_DATE.fullmatch(text)
+    if not found:
+        return None
+    year, month, day = found.groups()
+    start = datetime(int(year), int(month or 1), int(day or 1))
+    if day:
+        return start, start + timedelta(days=1)
+    return start, (start + timedelta(days=32)).replace(day=1) if month else start.replace(year=start.year + 1)
+
+
+def _fancy_result(tip: dict, match) -> tuple[bool | None, str]:
+    """(won? None = not known yet, what happened) of an open fancy tip on its Cricbuzz match."""
+    session = Session(tip["kind"], tip["number"], tip["team"])
+    return settle_session(session, tip["side"], tip["line"], match, datetime.fromisoformat(tip["created_at"]))
+
+
+def _site_pl(tip: dict, match) -> float | None:
+    """The tip's result in units had it been taken at the line and rate the site showed when it came."""
+    if tip.get("site_line") is None:
+        return None
+    won, _ = _fancy_result({**tip, "line": tip["site_line"]}, match)
+    if won is None:
+        return None
+    return round(tip["units"] * tip["site_rate"] / 100, 4) if won else -tip["units"]
+
+
+def _long_hold_pl(pos: Position, status: str) -> float | None:
+    """A held trade's result from its match's final status ('England won by 3 runs', 'Match drawn'), None if unreadable."""
+    if re.search(r"abandon|no result", status, re.IGNORECASE):
+        return 0.0
+    if re.search(r"\bdraw", status, re.IGNORECASE):
+        won = bool(re.search(r"\bdraw\b", pos.selection, re.IGNORECASE))
+    elif m := re.match(r"\s*(.+?)\s+won\b", status, re.IGNORECASE):
+        won = team_fits(pos.selection, [m.group(1)])
+    else:
+        return None
+    if pos.side == "lay":
+        return round(-pos.liability if won else pos.stake, 2)
+    return round(pos.stake * (pos.price - 1) if won else -pos.stake, 2)
+
+
+def _session_name(kind: str, number: int) -> str:
+    if kind == "wicket":
+        return f"wicket {number}"
+    if kind in PLAYER_KINDS:
+        return "runs" if kind == "player_runs" else "balls"
+    return f"{number} over runs" if number else "innings runs"
+
+
+def _fancy_text(team: str, kind: str, number: int, line: float, side: str) -> str:
+    return f"{team} toss" if kind == "toss" else f"{team} {_session_name(kind, number)} {line:g} {side.upper()}"
+
+
+def _seconds_until(hhmm: str) -> float:
+    """Seconds from now to the next HH:MM (local time)."""
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
 
 
 SCREENSHOT_KEEP_DAYS = 14
@@ -81,6 +185,46 @@ def _mentions(text: str, name: str, aliases: dict[str, str]) -> bool:
         return True
     expanded = " ".join(expand_team(word) for word in apply_aliases(text, aliases).split())
     return contains_player(name, expanded) or any(same_name(word, name) for word in name_words(text))
+
+
+SURE_WINNER, SURE_LOSER = 1.10, 11.0  # a runner's last price before its market closed: it had (nearly) won / lost
+RE_ENTRY_PRICE_MOVE = 0.15  # an entry on a team already traded, at a price this far from the trade's: an add
+RE_ENTRY_MIN_AGE = timedelta(minutes=10)  # ... if the trade is at least this old
+TIPPED_LATELY = timedelta(minutes=60)  # an entry naming no team takes the team of an entry tip this recent
+LIMIT_ALERT_EVERY = timedelta(minutes=15)  # messages missed through the AI's limit: one summary alert at most this often
+FANCY_POLL = timedelta(minutes=2)  # Cricbuzz lists a match's latest ~9 overs: read often enough to see every over
+FANCY_GIVE_UP = timedelta(hours=18)  # a fancy tip with no result by then is closed as 'unknown'
+TOSS_AHEAD = timedelta(hours=16)  # a toss call can come this long before its match (Panther: 05:00 for a 10:10 start)
+TOSS_RATE = 98  # the toss pays 98p for 1 (fancy rates are per 100)
+BEFORE_THE_TOSS = timedelta(minutes=45)  # a match starting later than this has nothing on Cricbuzz to read yet
+PLAYER_AHEAD = timedelta(hours=14)  # a player's line can come this long before the match ('pre match pick')
+NO_PRICE_FINISHED = 15  # price checks in a row with no price (~5+ min) after a clear last price: the match is over
+SK_CALL = re.compile(r"^\s*(?P<team>[A-Za-z][A-Za-z .]*?)\s+(?:toss\s+or\s+)?match\s+win\b", re.IGNORECASE | re.MULTILINE)
+SK_CALL_WITHIN = timedelta(hours=3)  # 'Sydney Match Win ✅' this long before a Sydney match is a call; after one, a result
+PASTE_FRESH = timedelta(minutes=3)  # a stamped line pasted from WhatsApp older than this is history, not a tip
+LADDER_POLL = timedelta(seconds=20)  # how often an SK-method match's price is read, once it is on
+LADDER_LONGEST = timedelta(hours=12)  # a match still on after this isn't watched: nor are its trades (POSITION_WINDOW)
+LADDER_NOT_LISTED = timedelta(minutes=40)  # a tipped match the site still doesn't list this long after its start: missed
+LADDER_GONE_READS = 15  # reads in a row (~5 min) without the match on the site, after it was there: it is over
+SAME_MATCH_WITHIN = timedelta(hours=12)  # two channels' tips with watches this close, on these teams, are one match
+LEAGUE_POLL = timedelta(minutes=30)  # how often trades with no league yet are looked up on Cricbuzz and ESPN
+LEDGER_START = datetime(2026, 10, 26, 19)  # the ₹1000-a-limit test began here: older trades had other stakes and channels
+PERIODS = {"day": "today", "week": "this week", "month": "this month", "year": "this year"}
+REPORT_DATE = re.compile(r"(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?")  # /report 2026, /report 2026-10, /report 2026-10-29
+
+
+def result_from_price(pos: Position, price: float | None) -> str:
+    """'win' / 'lose' for a trade whose match ended without a booking, from the last price seen for its runner
+    ('' when that price was not clear either way)."""
+    if not price:
+        return ""
+    if price <= SURE_WINNER:
+        runner_won = True
+    elif price >= SURE_LOSER:
+        runner_won = False
+    else:
+        return ""
+    return "win" if runner_won == (pos.side == "back") else "lose"
 
 
 def _close_signal(pos, loss_cut: bool) -> BetSignal:
@@ -165,6 +309,8 @@ class Pipeline:
         self._notifier = notifier
         self._channels = channels or Channels.single_chat(settings)
         self._parser = make_parser(settings)
+        self._cricbuzz = Cricbuzz()
+        self._last_look: dict[int, datetime] = {}  # pending entry -> when its price was last read (slow waits only)
         # One queue and reader per channel: channels are read side by side, each in the order its messages came.
         self._queues: dict[str, asyncio.Queue[asyncio.Future]] = {}
         self._readers: set[asyncio.Task] = set()
@@ -173,11 +319,18 @@ class Pipeline:
         # and the browser does one thing at a time.
         self._trade_lock = TradeLock()
         self._missing: dict[int, int] = {}  # trade id -> times in a row its match was missing from the site
+        self._last_price: dict[int, float] = {}  # trade id -> its closing price when last checked
+        self._no_price: dict[int, int] = {}  # trade id -> price checks in a row that found no price
+        self._ladder_gone: dict[int, int] = {}  # SK-method tip -> reads in a row that didn't find its match on the site
+        self._ladder_blocked: dict[int, str] = {}  # SK-method tip -> why its entry is blocked, told once
+        self._missed_by_limit = 0  # messages not read since the last "AI limit" alert
+        self._last_limit_alert = datetime.min
         self._paused = False
         self._asked: dict[int, Asked] = {}
         self._ask_number = 0
         self._held: dict[str, Held] = {}  # channel -> entry waiting for its stake message
         self._last_entry: dict[str, tuple[BetSignal, str]] = {}  # channel -> its latest entry and what became of it
+        self._entries: dict[str, deque[tuple[BetSignal, str]]] = {}  # channel -> its recent entries, the same way
 
     # --- messages -------------------------------------------------------------------------------
 
@@ -221,17 +374,31 @@ class Pipeline:
         history.append((msg.date, context_line(msg.date, msg.text, msg.image is not None)))
         if channel.profile.watch_links:
             await self._report_links(msg, channel)
-        if not channel.profile.trade:
+        if not channel.profile.trade or (self._mode == "live" and channel.profile.paper_only):
             return
 
         age = (datetime.now(timezone.utc) - msg.date).total_seconds()
         if age > self._risk.cfg(channel.name).signal_max_age_s:
             log.info("msg %s ignored: %.0fs old", msg.id, age)
             return
+        if channel.profile.jackpot_source:
+            await self._note_jackpot_days(msg.text, channel)
+        if channel.profile.pasted:
+            text = fresh_part_of_paste(msg.text, datetime.now(), PASTE_FRESH)
+            if not text and msg.image is None:  # kept for the audit: a block of old posts must not trade at today's prices
+                summary = "pasted history: nothing new in it, not traded"
+                self._store.log_message(msg.id, msg.text, False, ParsedMessage(signals=[], summary=summary), channel.name)
+                log.info("msg %s [%s]: %s", msg.id, channel.name, summary)
+                return
+            msg = replace(msg, text=text)
 
         signals, how, parsed = await self._read(msg, channel, context)
         if parsed is None:
-            return
+            if not channel.profile.ladder:
+                return
+            parsed = ParsedMessage(signals=[], summary="not read by the AI")  # its free limit: the SK check below needs no AI
+        if channel.profile.ladder and not signals:
+            signals = await self._call_before_match(msg.text, channel)
         if msg.image and parsed.summary:  # later tips can then refer to what the screenshot showed
             history[-1] = (msg.date, context_line(msg.date, f"{msg.text} [screenshot: {parsed.summary}]", False))
         message_id = self._store.log_message(msg.id, msg.text, msg.image is not None, parsed, channel.name)
@@ -252,17 +419,37 @@ class Pipeline:
                 ParsedMessage(signals=found, summary=summary)
         if msg.forwarded and not profile.act_on_forwards:  # e.g. a member's "book set maar diya" testimonial
             return [], "forward", ParsedMessage(signals=[], summary="forwarded message (context only)")
+        if profile.rules_only:
+            found = parse_known(msg.text, profile.rules) or []
+            summary = ", ".join(s.selection for s in found) or "not one of its formats"
+            return [as_bet(s, channel.name) for s in found], "rule-only" if found else "none", \
+                ParsedMessage(signals=found, summary=summary)
         if msg.voice and not profile.act_on_voice:
             # The transcript stays in the chat context, but a voice note alone is no instruction: transcribed
             # Tamil is too loose ("bookset-ku ready-aa irunga" = be ready for a bookset, read as "bookset").
-            msg = replace(msg, text=msg.caption)
+            msg = replace(msg, text=msg.caption, voice=False)
             if not msg.text and msg.image is None:
                 return [], "voice", ParsedMessage(signals=[], summary="voice note (context only)")
-        rule = parse_known(msg.text, profile.rules)
+        elif msg.voice and not VOICE_WORDS.search(msg.text):
+            return [], "voice", ParsedMessage(signals=[], summary="voice note without instruction words (not sent to "
+                                                                  "the AI)")
+        rule = None if msg.voice else parse_known(msg.text, profile.rules)
+        if profile.ai_filter and not rule and not msg.voice and not (
+                AI_WORDS.search(msg.text) or (profile.entry_words and re.search(profile.entry_words, msg.text, re.I))):
+            # a text, or a photo's caption, with no instruction word; a bare photo where tips always come in words
+            if msg.image is None:
+                return [], "none", ParsedMessage(signals=[], summary="no instruction words (not sent to the AI)")
+            if msg.text.strip() or not profile.bare_photos:
+                return [], "none", ParsedMessage(signals=[], summary="photo without instruction words (not sent "
+                                                                         "to the AI)")
         if rule:  # the channel's short names ("kg" -> Knights), so the rule's name compares with the AI's
             rule = [s.model_copy(update={"selection": expand_team(apply_aliases(s.selection, profile.aliases))})
                     for s in rule]
-        parsed = await self._parse_while_fresh(msg, context, profile.hint)
+            if profile.rules_first:
+                summary = ", ".join(f"{s.action} {s.selection}".strip() for s in rule)
+                return self._screen([as_bet(s, channel.name) for s in rule], msg, channel, "rule-only"), "rule-only", \
+                    ParsedMessage(signals=rule, summary=summary)
+        parsed = await self._parse_while_fresh(msg, context, profile.hint + (VOICE_HINT if msg.voice else ""))
         if parsed is None:
             return [], "missed", None
         signals, how = reconcile(rule, parsed.signals)
@@ -274,33 +461,70 @@ class Pipeline:
           ("Sl 1.2 coming", "1.66 fav ban" are price updates) or doesn't name the team it was read for;
         - a close in a message about a bookset still to come ("Ready for bookset", "wait for bookset");
         - a close naming a team that neither the message nor the one it replies to mentions (the AI took it from
-          the context) acts on the channel's latest entry, and on nothing when that entry was never placed."""
+          the context) acts on the channel's latest entry; when that entry was never placed, on the channel's open
+          trade in its match, else on nothing. When the latest entry was placed and the AI's team is another open trade
+          of the channel ("Again bookset" for the earlier trade), the AI's team is kept.
+        A voice note acts only as a plain, confident "book it now" (VOICE_CLOSE_NOW); what else it was read as stays in
+        the log, to judge later whether voice entries can be followed too."""
         profile = channel.profile
         kept = []
-        for sig in signals:
+        for index, sig in enumerate(signals):
+            if msg.voice and not (sig.action == "close" and sig.confidence >= VOICE_MIN_CONFIDENCE
+                                  and VOICE_CLOSE_NOW.search(msg.text) and not VOICE_NOT_NOW.search(msg.text)):
+                log.info("  voice note: no action on %s (%.2f): %r", sig.describe(), sig.confidence, msg.text[:100])
+                continue
             if (sig.action == "entry" and how == "ai-only" and profile.entry_words and msg.image is None
                     and not re.search(profile.entry_words, msg.text, re.IGNORECASE)):
                 log.info("  not an entry: %r has none of the entry words of %s", msg.text[:60], channel.name)
                 continue
             if (sig.action == "entry" and how == "ai-only" and profile.entry_words and msg.image is None
-                    and not _mentions(msg.text, sig.selection, profile.aliases)):
-                # "Now 8.4 odds back" (team in the next message), "Esl 6 odds back" read as England
+                    and sig.market != "fancy"  # a session ('2nd wicket call') takes its batting team from the context
+                    and not _mentions(msg.text, sig.selection, profile.aliases)
+                    and not self._same_team_as_last_entry(sig, channel)
+                    and not self._tipped_lately(sig, msg, channel)):
+                # "Now 8.4 odds back" (team in the next message), "Esl 6 odds back" read as England; but
+                # "10 odds green 5% back" right after a green-money India entry is India again, and
+                # "18p se entry kro guys" after "Navone WIN KRO" is Navone
                 log.info("  not an entry: %r doesn't name %s (the AI took it from the context)", msg.text[:60],
                          sig.selection)
                 continue
-            if sig.action == "close" and not_yet(msg.text):
+            if sig.action == "close" and any(earlier.action == "entry" and same_name(earlier.selection, sig.selection)
+                                             for earlier in signals[:index]):
+                # 'Leylah WIN KRO / BOOK SET COMPALSARY': advice for later, in the entry itself
+                log.info("  not a close: %r is the entry on %s", msg.text[:60], sig.selection)
+                continue
+            if sig.action == "close" and not msg.voice and not_yet(msg.text):
                 log.info("  not a close yet: %r", msg.text[:60])
                 continue
             if (sig.action == "close" and not _mentions(msg.text, sig.selection, profile.aliases)
                     and not _mentions(msg.reply_to, sig.selection, profile.aliases)):
-                latest = self._last_entry.get(channel.name)
-                if latest is not None:
-                    entry, status = latest
-                    if status not in (*COUNTED, "pending"):
-                        log.info("  close: the latest entry of %s (%s) was not placed, nothing to book",
+                again = self._again_entry(channel) if AGAIN.search(msg.text) else None
+                latest = again or self._last_entry.get(channel.name)
+                if again is not None:  # "Again bookset": the team entered again after its first bookset
+                    entry, status = again
+                    if status not in (*COUNTED, "pending") and \
+                            self._store.find_position(entry.selection, self._mode, channel.name, strict=True) is None:
+                        log.info("  close: the re-entry of %s on %s was not placed, nothing to book",
                                  channel.name, entry.selection)
                         continue
                     sig = sig.model_copy(update={"selection": entry.selection, "event": entry.event, "aka": ""})
+                elif latest is not None:
+                    entry, status = latest
+                    placed = status in (*COUNTED, "pending")
+                    if placed and sig.selection and self._open_trade(sig, channel):
+                        pass  # "Again bookset" for an earlier trade still open: the AI's team, not the newest entry
+                    elif not placed and self._store.find_position(entry.selection, self._mode, channel.name,
+                                                                  strict=True) is None:
+                        # (a re-entry skipped while the first trade on its team is open leaves the close for that)
+                        pos = self._trade_in_match_of(entry, channel)
+                        if pos is None:
+                            log.info("  close: the latest entry of %s (%s) was not placed, nothing to book",
+                                     channel.name, entry.selection)
+                            continue
+                        # SS 25 Oct: 'Pakistan 1.5u' (a fancy bet, skipped) after England back, then 'Losscut must'
+                        sig = sig.model_copy(update={"selection": pos.selection, "event": pos.event, "aka": ""})
+                    else:
+                        sig = sig.model_copy(update={"selection": entry.selection, "event": entry.event, "aka": ""})
             kept.append(sig)
         return kept
 
@@ -309,14 +533,67 @@ class Pipeline:
         if problem:
             await self._record(message_id, sig, BetResult("skipped", problem), Decision(False, problem))
             return
+        if sig.action == "close" and not self._open_trade(sig, channel):
+            held = self._trade_in_match_of(sig, channel)
+            if held:  # 'BACKED INDIA 3.05', then 'Loss cut @1.74 NZ': the team named is where the price is
+                sig = sig.model_copy(update={"selection": held.selection, "event": held.event, "aka": ""})
         if sig.action == "stake":
             await self._stake_message(sig, channel, message_id)
+            return
+        if sig.action == "entry" and sig.market == "fancy" and channel.profile.fancy_paper:
+            await self._fancy_entry(sig, channel, message_id)
+            return
+        if (sig.action in ("entry", "add") and channel.profile.ladder and self._bot is not None
+                and sig.market == "match_odds" and sig.side == "back"):
+            await self._start_ladder(sig.model_copy(update={"action": "entry"}), text, channel, message_id)
+            return
+        if (sig.action in ("entry", "add") and channel.profile.jackpot_days_only and self._mode == "live"
+                and not self._store.is_jackpot_day(datetime.now().date())):
+            reason = f"not an SK jackpot day: {channel.name} goes live only on those days (/jackpot)"
+            await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+            return
+        if sig.action in ("entry", "add") and NOT_ENTERED.search(text) and self._open_trade(sig, channel):
+            reason = f"a call for those not in yet: {channel.name} already holds {sig.selection}"
+            await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+            return
+        if sig.action == "add" or self._is_re_entry(sig, channel):
+            await self._add(sig, channel, how, message_id)
+            return
+        if (sig.action == "entry" and channel.profile.enter_before_start_min and self._bot is not None
+                and not sig.when_odds and await self._wait_for_start(sig, channel, message_id)):
             return
         if (sig.action == "entry" and how != "strict" and channel.profile.stake_wait_s and sig.units is None
                 and sig.amount is None and not sig.green_pct and not sig.when_odds):
             await self._hold(sig, channel, how, message_id)
             return
         await self._go(sig, channel, how, message_id)
+
+    async def _wait_for_start(self, sig: BetSignal, channel: Channel, message_id: int | None) -> bool:
+        """A tip posted hours before its match (SK Astro, 31 Oct: 2-3 h early, tried for 5 min, missed) is entered just
+        before the start, at the price then, and the price when tipped is noted to compare. False when there is
+        nothing to wait for (the match is on, or Cricbuzz doesn't list it): the entry goes ahead as usual."""
+        try:
+            matches = await self._cricbuzz.refresh_list()
+        except Exception:
+            log.warning("  no match time for %s: Cricbuzz could not be read", sig.selection, exc_info=True)
+            return False
+        now = datetime.now()
+        match = coming_match(matches, sig.selection, sig.event, now)
+        at = match.start - timedelta(minutes=channel.profile.enter_before_start_min) if match else now
+        if at <= now:
+            return False
+        async with self._trade_lock(_priority(sig)):
+            check = self._risk.precheck(sig)
+            if not check.ok:
+                await self._record(message_id, sig, BetResult("skipped", check.reason), check)
+                return True
+            price = await self._bot.quote(sig)
+            held = sig.model_copy(update={"not_before": at.isoformat(timespec="seconds"), "tip_price": price})
+            reason = (f"waiting for {' v '.join(name for name, _ in match.teams)}: starts {match.start:%d %b %H:%M}, "
+                      f"entry at {at:%H:%M}, price now {f'{price:g}' if price else 'not listed yet'}")
+            self._store.add_pending(held, self._mode, message_id, reason)
+            await self._record(message_id, held, BetResult("pending", reason, price), check)
+        return True
 
     async def _go(self, sig: BetSignal, channel: Channel, how: str, message_id: int | None) -> BetResult | None:
         """Acts on the instruction, or asks you first when the channel's confirm settings say so. Paper trading
@@ -332,10 +609,18 @@ class Pipeline:
         'green money 20%'. Returns the instruction and why it must be skipped ('' = go ahead)."""
         profile = channel.profile
         names = {"selection": expand_team(apply_aliases(sig.selection, profile.aliases))}
+        if sig.sport == "tennis":  # 'NAKASHIMA B' (surname, initial): the site finds players by surname
+            names["selection"] = re.sub(r"^(\S{3,})\s+[A-Za-z]\.?$", r"\1", names["selection"])
         names["event"] = " v ".join(expand_team(apply_aliases(side, profile.aliases)) for side in sig.event.split(" v "))
         sig = sig.model_copy(update=names)
+        if profile.rupees_per_unit and sig.amount and not sig.green_pct:  # the tipster's rupees, not ours
+            sig = sig.model_copy(update={"units": round(sig.amount / profile.rupees_per_unit, 2), "amount": None})
         if sig.action != "entry":
             return sig, ""
+        most = self._risk.cfg(channel.name).max_units_per_bet
+        if sig.units and most and sig.units > most:  # a big tip is still followed, at the most you allow
+            log.info("  %s: %g units capped at MAX_UNITS_PER_BET %g", sig.selection, sig.units, most)
+            sig = sig.model_copy(update={"units": most})
         if sig.green_pct:
             if profile.green_money != "stake":
                 return sig, f"green-money re-entry ({sig.green_pct:g}% of the profit) is off for {channel.name}"
@@ -433,13 +718,136 @@ class Pipeline:
             return await skip(f"no entry of {channel.name} in the last {window}s to top up")
         s = self._risk.cfg(channel.name)
         target = round(sig.amount if sig.amount else sig.units * s.unit_stake, 2)  # "Try 200 or 300": rupees
+        await self._raise_stake(pos, target, pos.price, sig, channel, message_id)
+
+    def _again_entry(self, channel: Channel) -> tuple[BetSignal, str] | None:
+        """The channel's latest entry on a team it had already booked a trade on (and what became of it)."""
+        for entry, status in reversed(self._entries.get(channel.name, ())):
+            if self._store.recently_closed(entry.selection, self._mode):
+                return entry, status
+        return None
+
+    def _same_team_as_last_entry(self, sig: BetSignal, channel: Channel) -> bool:
+        """The channel's latest entry (placed or not) was on this team: a follow-up entry may leave it unnamed."""
+        latest = self._last_entry.get(channel.name)
+        return bool(latest and sig.selection and same_name(latest[0].selection, sig.selection))
+
+    def _tipped_lately(self, sig: BetSignal, msg: IncomingMessage, channel: Channel) -> bool:
+        """An earlier message of the chat in the last TIPPED_LATELY was an entry on this team ('Navone WIN KRO'),
+        also when it came before the bot (re)started and so was only read as context."""
+        profile = channel.profile
+        earlier = list(self._history_for(msg.chat_id))[:-1]  # the last line is this message
+        return bool(sig.selection) and any(
+            msg.date - when <= TIPPED_LATELY and re.search(profile.entry_words, line, re.IGNORECASE)
+            and _mentions(line, sig.selection, profile.aliases) for when, line in earlier)
+
+    def _trade_in_match_of(self, entry: BetSignal, channel: Channel) -> Position | None:
+        """The channel's open trade in the match of this (unplaced) entry, on whichever side."""
+        sides = [side for side in entry.event.split(" v ") if side.strip(" ?")]
+        for pos in reversed(self._store.unclosed_positions(self._mode)):
+            if self._trade_is_for(pos, channel) and any(contains_player(side, pos.event) for side in sides):
+                return pos
+        return None
+
+    def _trade_is_for(self, pos: Position, channel: Channel) -> bool:
+        """The channel's own trade. SK's and your own channel's tips on a match share the first one's trade (one match, one
+        ₹3,000 at most, on paper too), and either can book it."""
+        if pos.channel == channel.name:
+            return True
+        other = self._channels.get(pos.channel)
+        return channel.profile.ladder and other is not None and other.profile.ladder
+
+    def _open_trade(self, sig: BetSignal, channel: Channel) -> Position | None:
+        """The channel's open trade on this instruction's team (by the AI's name, else the rules' spelling)."""
+        pos = self._store.find_position(sig.selection, self._mode, channel.name, strict=True)
+        if pos is None and sig.aka:
+            pos = self._store.find_position(sig.aka, self._mode, channel.name, strict=True)
+        return pos
+
+    async def _price_on_trade(self, pos: Position, sig: BetSignal) -> float | None:
+        """The site's price now on the trade's runner, on this instruction's side. None when it can't be read."""
+        if self._bot is None:
+            return None
+        async with self._trade_lock(TradeLock.OTHER):
+            return await self._bot.quote(sig.model_copy(update={"selection": pos.selection, "event": pos.event,
+                                                                "aka": ""}))
+
+    def _is_re_entry(self, sig: BetSignal, channel: Channel) -> bool:
+        """A new entry on a team the channel's trade is already on, posted after the duplicate window or at a
+        clearly different price ('35P entry kr lena sabhi log' an hour after 'Uchijima win karo', '30P rate hai
+        entry kr lo' 29 min after Chidekh at 2.7): more stake on that trade."""
+        if sig.action != "entry" or not sig.selection:
+            return False
+        pos = self._open_trade(sig, channel)
+        if pos is None:
+            return False
+        if sig.side in ("back", "lay") and sig.side != pos.side:
+            return True  # 'LAY KARO Rublev' on the channel's Rublev back: trading out (_add books it)
+        window = timedelta(minutes=self._risk.cfg(channel.name).duplicate_window_min)
+        opened = datetime.fromisoformat(pos.opened_at)
+        price = sig.when_odds or sig.odds
+        # a different price only counts once the trade is a while old: 'AB KRLO ENTRY' 2 min after the tip is
+        # the same entry, with '1.70 limit' misread as its price
+        moved = bool(price and pos.price and abs(price - pos.price) / pos.price > RE_ENTRY_PRICE_MOVE
+                     and opened <= trade_log.clock() - RE_ENTRY_MIN_AGE)
+        return moved or opened <= trade_log.clock() - window
+
+    async def _add(self, sig: BetSignal, channel: Channel, how: str, message_id: int | None) -> None:
+        """'Add one more 1 limit', 'HALF LIMIT EXTRA' or a re-entry: the open trade on that team gets that many
+        units more (1 if not given), at the tip's price (else the trade's), up to MAX_UNITS_PER_BET.
+        With no open trade on the team it is an entry."""
+        def skip(reason: str):
+            return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+
+        pos = self._open_trade(sig, channel)
+        if pos is None:
+            await self._go(sig.model_copy(update={"action": "entry"}), channel, how, message_id)
+            return
+        if self._paused:
+            return await skip("PAUSED: no new entries until /resume")
+        s = self._risk.cfg(channel.name)
+        if sig.confidence < s.min_confidence:  # SS 1 Nov: '3.7' alone, read as one more add at 0.40
+            return await skip(f"AI confidence {sig.confidence:.2f} below {s.min_confidence}")
+        odds = sig.odds or pos.price
+        extra = sig.amount if sig.amount else (sig.units or 1) * s.unit_stake
+        if sig.side and sig.side != pos.side:
+            price = await self._price_on_trade(pos, sig) if sig.side == "lay" and sig.odds else None
+            if not price or not other_runners_price(sig.odds, price):
+                # 'LAY KARO Rublev' while the channel's Rublev back is open: trading out of it, i.e. book it now
+                log.info("  %s on %s while the channel's %s is open: booking it", sig.side, pos.selection, pos.side)
+                close = sig.model_copy(update={"action": "close", "loss_cut": False, "odds": None, "units": None,
+                                               "amount": None, "selection": pos.selection, "event": pos.event,
+                                               "aka": ""})
+                await self.execute(close, message_id)
+                return
+            # '45P LAY KARO, Adolfo PLUS KARO' with Adolfo at 3.35: the favourite is laid at 1.45, which is more of the
+            # Adolfo back, not a way out of it. Sized as that lay: it wins about the stake if Adolfo wins.
+            log.info("  %g is the other runner's price (%s is %g): adding to the trade", sig.odds, pos.selection, price)
+            odds, extra = price, extra * (sig.odds - 1)
+        if pos.side == "back" and odds and self._s.max_back_odds and odds >= self._s.max_back_odds:
+            return await skip(f"can't add to the {pos.selection} back at {odds:g}: backs from "
+                              f"{self._s.max_back_odds:g} are placed as a lay of the opponent")
+        why = self._confirm_reason(sig.model_copy(update={"action": "entry"}), channel, how)
+        if why and (self._mode == "live" or self._s.confirm_in_dry_run):
+            return await skip(f"add not made: {why}")
+        await self._raise_stake(pos, round(pos.stake + extra, 2), odds, sig, channel, message_id)
+
+    async def _raise_stake(self, pos: Position, target: float, odds: float | None, sig: BetSignal,
+                           channel: Channel, message_id: int | None) -> None:
+        """Brings the trade's stake up to target (at most MAX_UNITS_PER_BET), at the price on offer now if it is
+        still close to odds."""
+        def skip(reason: str):
+            return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+
+        s = self._risk.cfg(channel.name)
+        if s.max_units_per_bet:  # topped up to the most you allow, as a big entry is
+            target = min(target, s.max_units_per_bet * s.unit_stake)
         extra = round(target - pos.stake, 2)
         if extra <= 0:
-            return await skip(f"{pos.selection} already has stake {pos.stake:g} (>= {target:g})")
-        if s.max_units_per_bet and target > s.max_units_per_bet * s.unit_stake:
-            return await skip(f"top-up to {target:g} is above MAX_UNITS_PER_BET")
+            return await skip(f"{pos.selection} already has stake {pos.stake:g} (>= {target:g}, "
+                              f"MAX_UNITS_PER_BET counted)")
         add = BetSignal(action="entry", sport=pos.sport, event=pos.event, market=pos.market, market_name="",
-                        selection=pos.selection, side=pos.side, odds=pos.price, line=None, units=None, amount=extra,
+                        selection=pos.selection, side=pos.side, odds=odds, line=None, units=None, amount=extra,
                         loss_cut=False, confidence=1.0, channel=channel.name)
         async with self._trade_lock(TradeLock.OTHER):
             if self._bot is None:
@@ -459,6 +867,10 @@ class Pipeline:
         """Carries out one instruction: safety checks, the site, the trade log and the alert. The tipster
         posts each instruction once, so anything the site can't take yet is retried until it goes through.
         note goes in front of the decision's reason (e.g. that live would have asked first)."""
+        if sig.action in ("close", "cancel") and (ladder := self._ladder_of(sig)):
+            sig, done = await self._ladder_instruction(sig, ladder, message_id)
+            if done:
+                return done
         if sig.action == "cancel":
             return await self._cancel(sig, message_id)
         async with self._trade_lock(_priority(sig)):
@@ -484,7 +896,7 @@ class Pipeline:
                     result = self._keep_retrying(sig, check, result)
                 elif result.status == "retry":
                     self._store.add_pending(sig, self._mode, message_id, result.reason)
-                    minutes = s.conditional_entry_min if sig.when_odds else self._s.entry_retry_min
+                    minutes = self._retry_minutes(sig, result.reason)
                     what = (f"waiting for the {sig.side} price to reach {sig.when_odds:g}" if sig.when_odds
                             else "will retry")
                     result = BetResult("pending", f"{what}, every {BOOKSET_RETRY_SECONDS}s for up to {minutes} "
@@ -513,9 +925,10 @@ class Pipeline:
 
     def _cancel_pending_entry(self, sig: BetSignal) -> bool:
         """A bookset / loss cut for a trade whose entry is still being retried: drop the entry instead."""
-        if self._store.find_position(sig.selection, self._mode, sig.channel):
+        own = self._mode != "live"  # on paper, each channel's trades are its own
+        if self._store.find_position(sig.selection, self._mode, sig.channel, own):
             return False  # we are in the trade: book it
-        pending_id = self._store.find_pending(sig.selection, self._mode, "entry")
+        pending_id = self._store.find_pending(sig.selection, self._mode, "entry", sig.channel if own else "")
         if pending_id is None:
             return False
         self._store.remove_pending(pending_id)
@@ -550,11 +963,20 @@ class Pipeline:
         again, so a stale price is never taken; after ENTRY_RETRY_MINUTES (CONDITIONAL_ENTRY_MINUTES for a
         waiting entry) the tip is reported as missed."""
         for pending_id, created_at, sig, message_id, last_reason in self._store.pending_instructions(self._mode):
+            if sig.not_before and datetime.now() < datetime.fromisoformat(sig.not_before):
+                continue  # held for its match: the site isn't opened until then
+            if self._looked_lately(pending_id, sig):
+                continue
             async with self._trade_lock(_priority(sig)):
                 if pending_id not in {p[0] for p in self._store.pending_instructions(self._mode)}:
                     continue  # cancelled meanwhile (e.g. the tipster booked first)
-                waited = (datetime.now() - datetime.fromisoformat(created_at)).total_seconds()
-                minutes = self._risk.cfg(sig).conditional_entry_min if sig.when_odds else self._s.entry_retry_min
+                if sig.not_before and self._paused:
+                    self._store.remove_pending(pending_id)
+                    reason = "PAUSED: no new entries until /resume"
+                    await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+                    continue
+                waited = (datetime.now() - datetime.fromisoformat(sig.not_before or created_at)).total_seconds()
+                minutes = self._retry_minutes(sig, last_reason)
                 if waited > minutes * 60:
                     self._store.remove_pending(pending_id)
                     result = BetResult("failed", f"{sig.action.upper()} MISSED after {minutes} min "
@@ -574,7 +996,30 @@ class Pipeline:
                     continue
                 self._store.remove_pending(pending_id)
                 result.reason = f"after {waited:.0f}s of {'waiting' if sig.when_odds else 'retrying'}: {result.reason}"
+                if sig.tip_price:
+                    result.reason += f" [price when tipped {sig.tip_price:g}]"
                 await self._record(message_id, sig, result, check)
+
+    def _looked_lately(self, pending_id: int, sig: BetSignal) -> bool:
+        """A waiting entry that can wait for days had its price read within the last SLOW_WAIT_EVERY."""
+        if not sig.when_odds or self._risk.cfg(sig).conditional_entry_min <= SLOW_WAIT_ABOVE_MIN:
+            return False
+        now = datetime.now()
+        if now - self._last_look.get(pending_id, datetime.min) < SLOW_WAIT_EVERY:
+            return True
+        self._last_look[pending_id] = now
+        return False
+
+    def _retry_minutes(self, sig: BetSignal, reason: str) -> int:
+        """How long an entry the site can't take yet is retried: a waiting entry until its price comes; a tennis
+        market suspended between points / at a medical break longer (27 Oct: a 5-minute suspension missed one)."""
+        if sig.when_odds:
+            return self._risk.cfg(sig).conditional_entry_min
+        if sig.not_before:
+            return HELD_ENTRY_MINUTES
+        if sig.sport == "tennis" and "suspended" in reason.lower():
+            return max(self._s.entry_retry_min, TENNIS_SUSPENDED_MINUTES)
+        return self._s.entry_retry_min
 
     async def _retry_pending_closes(self) -> None:
         """Booksets / loss cuts the site refused so far."""
@@ -607,24 +1052,34 @@ class Pipeline:
                 await self._record(None, sig, result, Decision(True, "retry", position=current))
 
     async def monitor(self) -> None:
-        """Books a trade automatically once booking it now would lock AUTO_BOOKSET_UNITS of profit
-        (the setting of the trade's channel)."""
-        if self._bot is None or not self._channels.any_auto_bookset():
+        """Watches the price of every open trade: the last one seen settles a trade whose match ends without a
+        booking (check_finished_matches). With AUTO_BOOKSET_UNITS (the setting of the trade's channel) it also
+        books a trade once booking it now would lock that much profit."""
+        if self._bot is None:
             return
-        log.info("Auto-bookset on, checked every %ds", self._s.monitor_interval_s)
+        log.info("Open trades' prices checked every %ds%s", self._s.monitor_interval_s,
+                 " (auto-bookset on)" if self._channels.any_auto_bookset() else "")
         while True:
             await asyncio.sleep(self._s.monitor_interval_s)
             for pos in self._store.open_positions(self._mode):
                 s = self._risk.cfg(pos)
-                if not s.auto_bookset_units:
-                    continue
-                target = s.auto_bookset_units * s.unit_stake
                 async with self._trade_lock(TradeLock.OTHER):  # a price check: tipsters' instructions go first
                     if pos.id not in {p.id for p in self._store.open_positions(self._mode)}:
                         continue  # booked by a tip meanwhile
                     price = await self._bot.exit_price(pos)
                     if price is None:
+                        # a match still listed after its market closed: settled once its last price was clear
+                        self._no_price[pos.id] = self._no_price.get(pos.id, 0) + 1
+                        if (self._no_price[pos.id] >= NO_PRICE_FINISHED
+                                and result_from_price(pos, self._last_price.get(pos.id))):
+                            await self._finish(pos)
                         continue
+                    self._no_price.pop(pos.id, None)
+                    self._last_price[pos.id] = price
+                    self._store.log_price(pos.id, price)
+                    if not s.auto_bookset_units:
+                        continue
+                    target = s.auto_bookset_units * s.unit_stake
                     profit = booked_profit(pos, price)
                     if profit < target:
                         continue
@@ -656,6 +1111,661 @@ class Pipeline:
             await asyncio.sleep(self._s.heartbeat_hours * 3600)
             await self._notifier.send(self.status_text())
 
+    # --- SK Astro's method: the other team laid in steps (tradebot/ladder.py) --------------------------
+
+    async def _start_ladder(self, sig: BetSignal, text: str, channel: Channel, message_id: int | None) -> None:
+        """A tip that a team wins: its match is watched from the start, or at once if it is on."""
+        def skip(reason: str):
+            return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+
+        if self._paused:
+            return await skip("PAUSED: no new entries until /resume")
+        if any(ladder.channel == channel.name and team_fits(sig.selection, [ladder.team])
+               for ladder in self._store.active_ladders(self._mode)):
+            return await skip(f"{sig.selection} is being watched already")
+        try:
+            matches = await self._cricbuzz.refresh_list()
+        except Exception:
+            log.warning("  no match time for %s: Cricbuzz could not be read", sig.selection, exc_info=True)
+            matches = []
+        now = datetime.now()
+        match = coming_match(matches, sig.selection, sig.event, now)
+        at = max(now, match.start - timedelta(minutes=channel.profile.enter_before_start_min)) if match else now
+        event = " v ".join(name for name, _ in match.teams) if match and "?" in sig.event else sig.event
+        twin, rival = self._tips_on_match(sig.selection, event, at, channel.name)
+        if twin:
+            self._store.update_ladder(twin.id, confirmed_by=channel.name)
+            return await skip(f"already watched: SIGNAL_CONFIRMED, {twin.channel} and {channel.name} both say {sig.selection}")
+        if rival:
+            self._store.update_ladder(rival.id, conflict=1)
+            return await skip(f"SIGNAL_CONFLICT: {rival.channel} says {rival.team}, {channel.name} says {sig.selection}: "
+                              f"no more entries in this match until /sk <team> decides")
+        async with self._trade_lock(TradeLock.OTHER):
+            price = await self._bot.quote(sig.model_copy(update={"event": event}))
+        self._store.add_ladder(self._mode, channel.name, sig.selection, event, at, message_id,
+                               "cricket" if match else sig.sport)
+        reason = (f"SK method: the other team laid in steps from {at:%d %b %H:%M}, booked at even; {sig.selection} now "
+                  f"{f'{price:g}' if price else 'not listed yet'}")
+        await self._record(message_id, sig, BetResult("pending", reason, price), Decision(True, reason))
+
+    def _tips_on_match(self, team: str, event: str, at: datetime, channel: str) -> tuple[Ladder | None, Ladder | None]:
+        """Another channel's SK-method tip on this match: (on the same team, on the other team)."""
+        sides = [side for side in event.split(" v ") if side.strip(" ?")]
+        for ladder in self._store.active_ladders(self._mode):
+            if ladder.channel == channel or abs(datetime.fromisoformat(ladder.start_at) - at) > SAME_MATCH_WITHIN:
+                continue
+            if team_fits(team, [ladder.team]):
+                return ladder, None
+            if (ladder.other and team_fits(team, [ladder.other])) or any(team_fits(ladder.team, [side]) for side in sides):
+                return None, ladder
+        return None, None
+
+    async def _call_before_match(self, text: str, channel: Channel) -> list[BetSignal]:
+        """SK Astro 1 Nov 13:05: 'Sydney Toss Loss / Sydney Match Win ✅', read as a result, 35 min before Sixers v
+        Hurricanes. A team's 'Match Win' shortly before its match is a call, whatever the ✅ looks like."""
+        found = SK_CALL.search(text)
+        if not found or len(text.splitlines()) > 3 or self._bot is None:  # a longer list is the day's results
+            return []
+        team = expand_team(found["team"].strip())
+        try:
+            matches = await self._cricbuzz.refresh_list()
+        except Exception:
+            log.warning("  no match time for %s: Cricbuzz could not be read", team, exc_info=True)
+            return []
+        now = datetime.now()
+        match = coming_match(matches, team, f"{team} v ?", now)
+        if match is None or match.start - now > SK_CALL_WITHIN:
+            return []
+        log.info("  '%s' comes %s before its match: a call", found[0].strip(), match.start - now)
+        return [BetSignal(action="entry", sport="cricket", event=f"{team} v ?", market="match_odds", market_name="",
+                          selection=team, side="back", odds=None, line=None, units=None, amount=None, loss_cut=False,
+                          confidence=1.0, channel=channel.name)]
+
+    async def ladder_watcher(self) -> None:
+        """Every LADDER_POLL, one look at each SK-method match that is on."""
+        if self._bot is None or not any(c.profile.ladder for c in self._channels.all()):
+            return
+        while True:
+            await asyncio.sleep(LADDER_POLL.total_seconds())
+            for ladder in self._store.active_ladders(self._mode):
+                try:
+                    await self._ladder_step(ladder)
+                except Exception:
+                    log.exception("SK method: could not look at %s", ladder.team)
+
+    async def _ladder_step(self, ladder: Ladder) -> None:
+        """Takes the step the price is in, stops the steps after a swing, books or exits by exit_call, ends when nothing
+        is left."""
+        now = datetime.now()
+        start = datetime.fromisoformat(ladder.start_at)
+        if now < start:
+            return  # a tip before its match: the site isn't opened until then
+        if now - start > LADDER_LONGEST:
+            return await self._end_ladder(ladder, "no longer watched, 12 hours after its start")
+        async with self._trade_lock(TradeLock.OTHER):  # a price check: tipsters' instructions go first
+            active = {now_on.id: now_on for now_on in self._store.active_ladders(self._mode)}
+            if ladder.id not in active:
+                return  # the tipster closed it meanwhile
+            ladder = active[ladder.id]  # as it is now: another tip's look may have blocked it
+            quote = await self._bot.other_team_quote(ladder.event, ladder.team)
+        if quote.gone:
+            misses = self._ladder_gone[ladder.id] = self._ladder_gone.get(ladder.id, 0) + 1
+            if ladder.other and misses >= LADDER_GONE_READS:
+                await self._end_ladder(ladder, "its match is over")
+            elif not ladder.other and now - start > LADDER_NOT_LISTED:
+                await self._end_ladder(ladder, f"ENTRY MISSED: {quote.problem}")
+            return
+        self._ladder_gone.pop(ladder.id, None)
+        if quote.lay is None:
+            log.info("  SK method, %s: no price: %s", ladder.team, quote.problem or "none on offer")
+            return
+        if not ladder.other:
+            ladder = replace(ladder, other=quote.other, event=quote.event or ladder.event, first_price=quote.lay)
+            self._store.update_ladder(ladder.id, other=ladder.other, event=ladder.event, first_price=ladder.first_price)
+            ladder = await self._note_rival(ladder)
+        self._store.log_price(-ladder.id, quote.lay)  # its path, to test other steps on later
+        team_back = quote.team_back or (round(quote.back / (quote.back - 1), 2) if quote.back and quote.back > 1 else None)
+        self._store.update_ladder(ladder.id, last_lay=quote.lay, last_back=quote.back, team_back=team_back)
+        trade = self._store.find_position(ladder.other, self._mode, ladder.channel, strict=True)
+        if ladder.last_step >= 0 and trade is None:
+            return await self._end_ladder(ladder, "its trade is closed")
+        if trade and quote.back and team_back and await self._ladder_exit(ladder, trade, quote.back, team_back):
+            return
+        if ladder.stops_at(quote.lay):
+            ladder = replace(ladder, stopped=True)
+            self._store.update_ladder(ladder.id, stopped=1)
+            await self._ladder_note(ladder, f"{ladder.other} back up at {quote.lay:g}: no more entries in this match, and "
+                                            f"none if it comes down again")
+        step = ladder.step_to_take(quote.lay)
+        if step is not None and not self._paused:
+            blocked = self._ladder_block(ladder)
+            if not blocked:
+                await self._take_step(ladder, step, quote, trade)
+            elif self._ladder_blocked.get(ladder.id) != blocked:
+                self._ladder_blocked[ladder.id] = blocked
+                await self._ladder_note(ladder, f"entry {ladder.entries + 1} BLOCKED: {blocked}")
+
+    async def _ladder_note(self, ladder: Ladder, text: str) -> None:
+        log.info("  SK method, %s: %s", ladder.team, text)
+        if self._notifier:
+            await self._notifier.send(f"🪜 *SK method*, {ladder.team}: {text}")
+
+    async def _note_rival(self, ladder: Ladder) -> Ladder:
+        """A tip whose other team only now is known: it may be what another channel tipped."""
+        for rival in self._store.active_ladders(self._mode):
+            if rival.id != ladder.id and rival.channel != ladder.channel and team_fits(ladder.other, [rival.team]) and \
+                    abs(datetime.fromisoformat(rival.start_at) - datetime.fromisoformat(ladder.start_at)) <= SAME_MATCH_WITHIN:
+                self._store.update_ladder(rival.id, conflict=1)
+                self._store.update_ladder(ladder.id, conflict=1)
+                await self._ladder_note(ladder, f"SIGNAL_CONFLICT: {ladder.channel} says {ladder.team}, {rival.channel} says "
+                                                f"{rival.team}: no more entries until /sk <team> decides")
+                return replace(ladder, conflict=True)
+        return ladder
+
+    def _ladder_rules(self, channel: str) -> LadderRules:
+        found = self._channels.get(channel)
+        return LadderRules(**found.profile.ladder_rules) if found else LadderRules()
+
+    def _ladder_block(self, ladder: Ladder) -> str:
+        """Why no entry can go in now ('' = it can): a stale market, always; the limits on opening a new match."""
+        rules = self._ladder_rules(ladder.channel)
+        prices = self._store.last_prices(-ladder.id, rules.frozen_reads)
+        if len(prices) == rules.frozen_reads and len(set(prices)) == 1:
+            return f"market PAUSED, {ladder.other} at {prices[0]:g} for {rules.frozen_reads} reads: the data is stale"
+        if ladder.entries:
+            return ""
+        unit = self._risk.cfg(ladder.channel).unit_stake
+        if sum(1 for other in self._store.active_ladders(self._mode) if other.entries) >= rules.max_open:
+            return f"{rules.max_open} matches already open"
+        closed = self._store.closed_results(self._mode, [c.name for c in self._channels.all() if c.profile.ladder])
+        now = datetime.now()
+        lost_today = sum(pl for at, pl in closed if at and at[:10] == now.date().isoformat())
+        if lost_today <= -rules.daily_loss * unit:
+            return f"the day's loss limit of {rules.daily_loss:g} limits is reached ({lost_today / unit:+.2f})"
+        total = best = 0.0
+        for _, pl in closed:
+            total += pl
+            best = max(best, total)
+        if best - total >= rules.max_drawdown * unit:
+            return f"the drawdown limit of {rules.max_drawdown:g} limits is reached ({(total - best) / unit:+.2f})"
+        losses = [at for at, pl in closed if pl < 0 and at]
+        if losses and now - datetime.fromisoformat(losses[-1]) < timedelta(minutes=rules.cooldown_min):
+            return f"cooling down for {rules.cooldown_min} min after a losing trade"
+        return ""
+
+    async def _ladder_exit(self, ladder: Ladder, trade: Position, other_back: float, team_back: float) -> bool:
+        """Books or exits when the user's rules say so (tradebot/ladder.py, exit_call). True when it did."""
+        rules = self._ladder_rules(ladder.channel)
+        unit = self._risk.cfg(ladder.channel).unit_stake
+        target = rules.profit_target * unit
+        pl = booked_profit(trade, other_back)
+        peak = max(ladder.peak, pl)
+        call = exit_call(pl, team_back, other_back, target, rules.giveback * unit, peak, ladder.was_favourite, rules.equal_band)
+        self._store.update_ladder(ladder.id, peak=peak, last_pl=pl, waiting=int(call == WAIT_FAVOURITE),
+                                  was_favourite=int(ladder.was_favourite or team_back < other_back))
+        prices = f"{ladder.team} {team_back:g}, {ladder.other} {other_back:g}"
+        if call == WAIT_FAVOURITE and not ladder.waiting:
+            await self._ladder_note(ladder, f"PROFIT CONDITION SATISFIED, WAITING FOR FAVOURITE CONFIRMATION: P&L {pl:+,.0f}, {prices}")
+        reason = {BOOKSET: f"BOOKSET TRIGGERED, both conditions: P&L {pl:+,.0f} and {ladder.team} favourite ({prices})",
+                  EQUAL_EXIT: f"EQUAL-ODDS EXIT: {prices}, P&L {pl:+,.0f}, under the {target:,.0f} target",
+                  FELL_BACK: f"EXIT: {ladder.team} was favourite and lost it ({prices}), P&L {pl:+,.0f}",
+                  GIVEBACK: f"EXIT, profit giving back: best {peak:+,.0f}, now {pl:+,.0f} ({prices})"}.get(call)
+        if reason is None:
+            return False
+        await self._end_ladder(ladder, reason)
+        await self.execute(_close_signal(trade, loss_cut=False), ladder.message_id)
+        return True
+
+    async def _take_step(self, ladder: Ladder, step: int, quote: TeamQuote, trade: Position | None) -> None:
+        """One unit more on the lay of the other team. The next look tries again if the site can't take it now."""
+        s = self._risk.cfg(ladder.channel)
+        unit = s.unit_stake
+        if trade and s.max_units_per_bet and trade.stake + unit > s.max_units_per_bet * unit:
+            self._store.update_ladder(ladder.id, stopped=1)  # or each look would try, and alert, again
+            log.info("  SK method, %s: no entry %d, MAX_UNITS_PER_BET %g reached", ladder.team, step + 1, s.max_units_per_bet)
+            return
+        sig = BetSignal(action="entry", sport=ladder.sport, event=quote.event or ladder.event, market="match_odds",
+                        market_name="", selection=quote.other, side="lay", odds=quote.lay, line=None, units=None,
+                        amount=unit, loss_cut=False, confidence=1.0, channel=ladder.channel)
+        if trade is None:
+            async with self._trade_lock(TradeLock.OTHER):
+                check = self._risk.precheck(sig)
+                if not check.ok:
+                    await self._record(ladder.message_id, sig, BetResult("skipped", check.reason), check)
+                    await self._end_ladder(ladder, f"not entered: {check.reason}")
+                    return
+                result = await self._bot.place(sig, None)
+                if result.status in COUNTED:
+                    result.reason = f"SK method, entry {step + 1}: {result.reason}"
+                    await self._record(ladder.message_id, sig, result, check)
+            taken = result.status in COUNTED
+        else:
+            await self._raise_stake(trade, round(trade.stake + unit, 2), quote.lay, sig,
+                                    self._channels.get(ladder.channel), ladder.message_id)
+            taken = self._store.position(trade.id).stake > trade.stake
+        if not taken:
+            log.info("  SK method, %s: entry %d not taken yet", ladder.team, step + 1)
+            return
+        prices = ",".join(filter(None, (ladder.entry_prices, f"{quote.lay:g}")))
+        self._store.update_ladder(ladder.id, last_step=step, entries=ladder.entries + 1, entry_prices=prices)
+
+    async def _end_ladder(self, ladder: Ladder, reason: str) -> None:
+        self._store.end_ladder(ladder.id, reason)
+        self._ladder_gone.pop(ladder.id, None)
+        first = f", {ladder.other} first read at {ladder.first_price:g}" if ladder.first_price else ""
+        text = f"{ladder.team}: {reason} ({ladder.entries} of {len(STEPS)} entries{first})"
+        log.info("SK method, %s", text)
+        if self._notifier:
+            await self._notifier.send(f"🪜 *SK method*, {text}")
+
+    def _ladder_of(self, sig: BetSignal) -> Ladder | None:
+        """The latest SK-method tip a bookset or cancel is about, by its team or the team it lays (any, when it names
+        none). Your own commands reach any channel's, and a channel that tipped the same team reaches the one trade."""
+        name = sig.selection.strip(" ?")
+        for ladder in self._store.recent_ladders(self._mode):
+            if sig.channel in (ladder.channel, ladder.confirmed_by, MANUAL) and (
+                    not name or team_fits(name, [ladder.team]) or (ladder.other and team_fits(name, [ladder.other]))):
+                return ladder
+        return None
+
+    async def _ladder_instruction(self, sig: BetSignal, ladder: Ladder,
+                                  message_id: int | None) -> tuple[BetSignal, BetResult | None]:
+        """A bookset or cancel on an SK-method tip means no more entries. A bookset then acts on the lay of the other
+        team, whichever team it names; the result is given when there is nothing more to do."""
+        if ladder.ended_at is None:
+            await self._end_ladder(ladder, "cancelled" if sig.action == "cancel" else "bookset asked for")
+        trade = self._store.find_position(ladder.other, self._mode, ladder.channel, strict=True) if ladder.other else None
+        if sig.action == "close" and trade:  # as the trade's own channel: the other one may have asked
+            return sig.model_copy(update={"selection": trade.selection, "event": trade.event, "aka": "",
+                                          "channel": trade.channel}), None
+        if sig.action == "cancel":
+            result = BetResult("placed", f"{ladder.team}: no more entries" + (f"; the {trade.selection} lay stays open"
+                                                                              if trade else ""))
+        else:
+            result = BetResult("skipped", f"{ladder.team}: no entry had gone in, nothing to book")
+        await self._record(message_id, sig, result, Decision(False, result.reason))
+        return sig, result
+
+    def _ladder_status(self, ladder: Ladder) -> str:
+        """All of a tip at a glance, in the order the user asked for."""
+        rules = self._ladder_rules(ladder.channel)
+        unit = self._risk.cfg(ladder.channel).unit_stake
+        trade = self._store.find_position(ladder.other, self._mode, ladder.channel, strict=True) if ladder.other else None
+        signal = {True: f"SIGNAL_CONFLICT, {ladder.channel} alone says {ladder.team}"}.get(ladder.conflict) or (
+            f"SIGNAL_CONFIRMED, {ladder.channel} + {ladder.confirmed_by}" if ladder.confirmed_by else ladder.channel)
+        lines = [f"• *{ladder.event}*: {ladder.team} (lays {ladder.other or 'the other team'}) · {ladder.state}",
+                 f"  Signal: {signal}. Watched from {ladder.start_at[8:10]}/{ladder.start_at[5:7]} {ladder.start_at[11:16]}"]
+        if ladder.last_back and ladder.team_back:
+            favourite = ladder.team if ladder.team_back < ladder.last_back else ladder.other
+            lines.append(f"  Odds: {ladder.team} {ladder.team_back:g}, {ladder.other} {ladder.last_back:g} (lay {ladder.last_lay:g}). "
+                         f"Favourite: {favourite}")
+        taken = ladder.entry_prices.split(",") if ladder.entry_prices else []
+        later = "blocked" if ladder.stopped or ladder.conflict else "waiting"
+        lines.append("  Entries: " + " · ".join(f"{n + 1} {'@' + taken[n] if n < len(taken) else later}" for n in range(len(STEPS))))
+        if trade:
+            target = rules.profit_target * unit
+            pl = ladder.last_pl if ladder.last_pl is not None else booked_profit(trade, ladder.last_back or trade.price)
+            lines.append(f"  Stake {trade.stake:,.0f}, liability {trade.liability:,.0f}, P&L now {pl:+,.0f}")
+            lines.append(f"  Target {target:,.0f}: {'yes' if pl >= target else 'no'}. Favourite: "
+                         f"{'yes' if ladder.team_back and ladder.last_back and ladder.team_back < ladder.last_back else 'no'}. "
+                         f"Bookset: {'waiting' if ladder.waiting else 'no'}. Entries stopped: {'yes' if ladder.stopped else 'no'}")
+        return "\n".join(lines)
+
+    def _ladders_text(self) -> str:
+        lines = [self._ladder_status(ladder) for ladder in self._store.active_ladders(self._mode)]
+        return "🪜 *SK method*\n" + "\n".join(lines) if lines else ""
+
+    def _decide_conflict(self, team: str) -> str:
+        """/sk <team> on a match SK and your channel disagree on. The text to answer with, '' to go on and start its watch."""
+        for ladder in self._store.active_ladders(self._mode):
+            if not ladder.conflict:
+                continue
+            if team_fits(team, [ladder.team]):
+                self._store.update_ladder(ladder.id, conflict=0)
+                return f"✅ {ladder.team}: decided, its entries go on."
+            if ladder.other and team_fits(team, [ladder.other]):
+                if ladder.entries:
+                    return f"⚠️ {ladder.team} already has {ladder.entries} entries: it stays, with no more. /bookset {ladder.team} closes it."
+                self._store.end_ladder(ladder.id, f"the conflict was decided for {team}")
+        return ""
+
+    async def _sk_command(self, text: str) -> str:
+        """/sk: the tips being watched. /sk <tip>: a tip you got elsewhere (SK's private posts), as if SK had posted it."""
+        channel = next((c for c in self._channels.all() if c.profile.ladder), None)
+        if channel is None:
+            return "⚠️ No channel in channels.json uses the SK method."
+        if not text:
+            return self._ladders_text() or "🪜 No SK tip is being watched."
+        team, other = read_sk_tip(text)
+        if not team:
+            raise ValueError("give a team: /sk UAE Toss or Match Win")
+        team, other = expand_team(team), expand_team(other)
+        decided = self._decide_conflict(team)
+        if decided:
+            return decided
+        sig = BetSignal(action="entry", sport="cricket", event=f"{team} v {other}", market="match_odds", market_name="",
+                        selection=team, side="back", odds=None, line=None, units=None, amount=None, loss_cut=False,
+                        confidence=1.0, channel=channel.name)
+        await self._start_ladder(sig, text, channel, None)
+        return ""  # the decision's own alert says what happened
+
+    async def _note_jackpot_days(self, text: str, channel: Channel) -> None:
+        for day in jackpot_days_in(text, datetime.now().date()):
+            if self._store.add_jackpot_day(day, channel.name):
+                log.info("%s: jackpot day %s", channel.name, day)
+                if self._notifier:
+                    await self._notifier.send(f"📅 *{channel.name}*: jackpot day {day:%d %b}")
+
+    def _jackpot_command(self, args: list[str]) -> str:
+        today = datetime.now().date()
+        if not args:
+            return self._jackpot_text()
+        if args[0].lower() == "off":
+            day = parse_day(args[1:], today)
+            return f"✅ {day:%d %b} removed." if self._store.remove_jackpot_day(day) else f"⚠️ {day:%d %b} wasn't listed."
+        day = parse_day(args, today)
+        self._store.add_jackpot_day(day, MANUAL)
+        return f"✅ Jackpot day: {day:%d %b}.\n{self._jackpot_text()}"
+
+    def _jackpot_text(self) -> str:
+        """The days, and how each jackpot-days channel did on them and on the other days since the first."""
+        days = self._store.jackpot_days()
+        shown = ", ".join(f"{date.fromisoformat(day):%d %b}" for day in days[-15:]) or "none yet"
+        lines = [f"📅 *SK jackpot days*: {shown}"]
+        for channel in self._channels.all():
+            if not (channel.profile.jackpot_days_only and days):
+                continue
+            by_day = self._store.channel_days(self._mode, channel.name)
+            on = [by_day[day] for day in days if day in by_day]
+            off = [result for day, result in by_day.items() if day not in days and day >= days[0]]
+            lines.append(f"{channel.name} on those days: {sum(n for n, _ in on)} trades, {sum(pl for _, pl in on):+.0f}")
+            lines.append(f"{channel.name} on other days: {sum(n for n, _ in off)} trades, {sum(pl for _, pl in off):+.0f}")
+        return "\n".join(lines)
+
+    # --- fancy (session) tips, on paper -------------------------------------------------------------
+
+    async def _fancy_entry(self, sig: BetSignal, channel: Channel, message_id: int | None) -> None:
+        """A session tip ('06 OVER 56 YES WEST IND', 'Meg Lanning 87 Runs Yes') or a toss call: kept on paper, settled
+        later from Cricbuzz. There is no code that places these bets."""
+        session = read_session(sig.market_name, sig.selection, sig.event)
+        side = {"back": "yes", "lay": "no"}.get(sig.side, sig.side)
+        toss = session is not None and session.kind == "toss"
+        line = 0.0 if toss else sig.line
+
+        def skip(reason: str):
+            return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+
+        if session is None or line is None or side not in ("yes", "no") or not session.team:
+            return await skip("fancy tip not understood: it needs the over or wicket, the team, the line and yes/no")
+        if any((t["team"], t["kind"], t["number"], t["line"], t["side"]) ==
+               (session.team, session.kind, session.number, line, side) and t["channel"] == channel.name
+               for t in self._store.open_fancy(self._mode)):
+            return await skip("duplicate of an open fancy tip")
+        unit = self._risk.cfg(channel.name).unit_stake
+        units = round(sig.units or (sig.amount / unit if sig.amount and unit else 1.0), 2)
+        quote = await self._fancy_quote(sig, session, side)
+        self._store.add_fancy(self._mode, channel.name, message_id, sig.event, session.team, session.kind,
+                              session.number, line, side, TOSS_RATE if toss else sig.odds, units,
+                              quote.name if quote else "", quote.line if quote else None, quote.rate if quote else None)
+        reason = (f"FANCY on paper: {_fancy_text(session.team, session.kind, session.number, line, side)}, {units:g}u; "
+                  f"settled from Cricbuzz")
+        if quote:
+            reason += (f"; site {quote.name}: {side.upper()} {quote.line:g} @{quote.rate:g}, other side "
+                       f"{quote.other_line:g}{', ball running' if quote.closed else ''}"
+                       f"{'; ' + quote.slip if quote.slip else ''}")
+        elif self._bot is not None and not toss:
+            reason += "; site line not found"
+        await self._record(message_id, sig, BetResult("paper", reason), Decision(True, reason))
+
+    async def _fancy_quote(self, sig: BetSignal, session: Session, side: str):
+        """What the site offers for this tip now. A tip stays on paper whatever happens on the site."""
+        if self._bot is None:
+            return None
+        try:
+            async with self._trade_lock(_priority(sig)):
+                return await self._bot.fancy_quote(sig.event, session, side)
+        except Exception:
+            log.warning("  fancy: could not read the site's line", exc_info=True)
+            return None
+
+    async def long_hold_settler(self) -> None:
+        """Every LONG_HOLD_POLL, for channels whose trades can run for days (see _settle_long_holds)."""
+        if not any(self._risk.cfg(c.name).both_sides_in_match for c in self._channels.all()):
+            return
+        while True:
+            await asyncio.sleep(LONG_HOLD_POLL.total_seconds())
+            try:
+                await self._settle_long_holds()
+            except Exception:
+                log.warning("long holds: Cricbuzz could not be read this time", exc_info=True)
+
+    async def _settle_long_holds(self) -> None:
+        """Nothing watches a trade after POSITION_WINDOW, and a Test match runs for days: its result comes from Cricbuzz
+        once the match is over. An order still waiting by then was never matched: no bet, nothing to count."""
+        trades = [p for p in (*self._store.old_open_positions(self._mode), *self._store.unsettled(self._mode))
+                  if self._risk.cfg(p).both_sides_in_match]
+        orders = [p for p in self._store.pending_instructions(self._mode)
+                  if p[2].when_odds and self._risk.cfg(p[2]).both_sides_in_match]
+        if not trades and not orders:
+            return
+        matches = await self._cricbuzz.refresh_list()
+        for pos in trades:
+            match = finished_match(matches, pos.selection, pos.event, datetime.fromisoformat(pos.opened_at))
+            pl = _long_hold_pl(pos, match.status) if match else None
+            if pl is None:
+                continue
+            self._store.set_closed(pos.id, pl=pl, how="settled")
+            log.info("HELD TRADE settled: %s %s @ %g -> %s (%+g)", pos.channel, pos.selection, pos.price, match.status, pl)
+            if self._notifier:
+                await self._notifier.send(f"📘 *HELD TRADE {'WON ✅' if pl > 0 else 'LOST ❌' if pl < 0 else 'VOID'}* (paper)\n"
+                                          f"[{pos.channel}] {pos.selection} @ {pos.price:g}, stake {pos.stake:g}\n"
+                                          f"{match.status}\n{pl:+g}")
+        for pending_id, created_at, sig, message_id, _ in orders:
+            match = finished_match(matches, sig.selection, sig.event, datetime.fromisoformat(created_at))
+            if match:
+                self._store.remove_pending(pending_id)
+                reason = f"order @ {sig.when_odds:g} never matched, no bet: {match.status}"
+                await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+
+    async def fancy_settler(self) -> None:
+        """Every FANCY_POLL while fancy tips are open: finds each tip's match on Cricbuzz, reads its latest overs and
+        settles what is known. A tip still open after FANCY_GIVE_UP is closed as 'unknown' (no result found)."""
+        if not any(c.profile.fancy_paper for c in self._channels.all()):
+            return
+        while True:
+            await asyncio.sleep(FANCY_POLL.total_seconds())
+            try:
+                await self._settle_fancy(self._cricbuzz)
+            except Exception:
+                log.warning("fancy tips: Cricbuzz could not be read this time", exc_info=True)
+
+    async def _settle_fancy(self, cricbuzz: Cricbuzz) -> None:
+        tips = self._store.open_fancy(self._mode)
+        if not tips:
+            return
+        matches = {m.match_id: m for m in await cricbuzz.refresh_list()}
+        for tip in tips:
+            if tip["match_id"]:
+                if tip["match_id"] not in matches:  # finished and off the live page: from its scorecard
+                    match = await cricbuzz.match_by_id(tip["match_id"])
+                    if match:
+                        matches[match.match_id] = match
+                continue
+            found = await self._match_of_tip(tip, matches, cricbuzz)
+            if found:
+                tip["match_id"] = found.match_id
+                self._store.set_fancy_match(tip["id"], found.match_id, " v ".join(name for name, _ in found.teams))
+        now = datetime.now()
+        for match_id in {t["match_id"] for t in tips if t["match_id"] in matches}:
+            match = matches[match_id]
+            if match.start - BEFORE_THE_TOSS > now:
+                continue
+            sessions = [t for t in tips if t["match_id"] == match_id and t["kind"] in ("runs", "wicket")]
+            try:
+                if sessions:
+                    await cricbuzz.refresh_overs(match)
+                await cricbuzz.refresh_scorecard(match)
+                if any(_fancy_result(t, match)[0] is None for t in sessions):
+                    await cricbuzz.refresh_commentary(match)  # overs bowled before the bot read the match (or a restart)
+            except Exception:  # one match's pages must not keep the others from being settled
+                log.warning("fancy tips: match %s could not be read this time", match_id, exc_info=True)
+        for tip in tips:
+            match = matches.get(tip["match_id"])
+            won, note = _fancy_result(tip, match) if match else (None, "")
+            what = f"[{tip['channel']}] " + _fancy_text(tip["team"], tip["kind"], tip["number"], tip["line"], tip["side"])
+            if won is None:
+                void = match is not None and re.search(r"abandon|no result", f"{match.state} {match.status}", re.IGNORECASE)
+                if void or now - datetime.fromisoformat(tip["created_at"]) > FANCY_GIVE_UP:
+                    outcome = "void" if void else "unknown"
+                    note = note or ("match abandoned" if void else
+                                    "match not found on Cricbuzz" if match is None else "result not readable")
+                    self._store.settle_fancy(tip["id"], outcome, 0.0, note)
+                    log.info("FANCY %s: %s (%s)", outcome.upper(), what, note)
+                continue
+            rate = tip["rate"] or 100
+            pl = round(tip["units"] * rate / 100, 4) if won else -tip["units"]
+            site_pl = _site_pl(tip, match)
+            self._store.settle_fancy(tip["id"], "won" if won else "lost", pl, note, site_pl)
+            log.info("FANCY %s: %s -> %s (%+g units, at the site's line %s)", "WON" if won else "LOST", what, note, pl,
+                     "?" if site_pl is None else f"{site_pl:+g}")
+            if self._notifier:
+                at_site = "" if site_pl is None else \
+                    f"\nAt the site's line {tip['site_line']:g} @{tip['site_rate']:g}: {site_pl:+g} units"
+                await self._notifier.send(f"📐 *FANCY {'WON ✅' if won else 'LOST ❌'}* (paper)\n{what}\n"
+                                          f"Result: {note}\n{pl:+g} units{at_site}")
+
+    async def _match_of_tip(self, tip: dict, matches: dict[int, Match], cricbuzz: Cricbuzz) -> Match | None:
+        """The Cricbuzz match of a fancy tip. A toss call: the team's next match. A player's line: the match the tip
+        names, else the limited-overs match on now whose scorecard has the player. A session: by its batting side."""
+        created = datetime.fromisoformat(tip["created_at"])
+        team = tip["team"]
+        if tip["kind"] == "toss":
+            found = [m for m in matches.values() if m.has_team(team) and created - timedelta(hours=1) <= m.start <= created + TOSS_AHEAD]
+            return min(found, key=lambda m: (-m.team_score(team), m.start), default=None)
+        if tip["kind"] in PLAYER_KINDS:
+            near = [m for m in matches.values() if m.start - PLAYER_AHEAD <= created <= m.start + timedelta(hours=14)]
+            sides = [side for side in tip["event"].split(" v ") if side.strip(" ?")]
+            named = [m for m in near if sides and all(m.has_team(side) for side in sides)]
+            if named:
+                return min(named, key=lambda m: abs(m.start - created))
+            for match in near:
+                if match.fmt.upper() != "TEST" and match.state != "Preview" and created <= match.start + timedelta(hours=6):
+                    await cricbuzz.refresh_scorecard(match)
+                    if any(same_batter(team, name) for name in match.batters):
+                        return match
+            return None
+        found = [m for m in matches.values() if m.has_team(team)
+                 and m.start - timedelta(hours=1) <= created <= m.start + timedelta(hours=14)]
+        # the side named best ('NZ' is New Zealand, not New Zealand A), a limited-overs match (sessions are
+        # T20 / ODI calls), one being played
+        found.sort(key=lambda m: (m.team_score(team), m.fmt.upper() not in ("TEST", ""),
+                                  m.state not in ("Complete", "Preview")), reverse=True)
+        return found[0] if found else None
+
+    async def league_namer(self) -> None:
+        """At the start and every LEAGUE_POLL: names the league or tournament of the trades and fancy tips that have
+        none yet."""
+        while True:
+            try:
+                rows = self._store.trades_without_league(self._mode, LEDGER_START)
+                if rows:
+                    for trade_id, league in (await leagues_of(rows, datetime.now())).items():
+                        self._store.set_league(trade_id, league)
+                tips = self._store.fancy_without_league(self._mode, LEDGER_START)
+                if tips:
+                    for tip_id, league in (await leagues_of(tips, datetime.now())).items():
+                        self._store.set_fancy_league(tip_id, league)
+            except Exception:
+                log.warning("leagues: Cricbuzz or ESPN could not be read this time", exc_info=True)
+            await asyncio.sleep(LEAGUE_POLL.total_seconds())
+
+    def _is_running(self, channel: str) -> bool:
+        """A removed channel's trades stay in the ledger, but the reports leave them out."""
+        return channel in (MANUAL, "", "-") or self._channels.get(channel) is not None
+
+    def _results(self, since: datetime, until: datetime = datetime.max) -> list[dict]:
+        """The running channels' trades and fancy bets in [since, until), with their sport and league named. A fancy
+        bet counts at the site's line when it was read then, else at the tip's; a void one not at all."""
+        since = max(since, LEDGER_START)
+        unit = self._s.unit_stake
+        rows = [{**r, "sport": sport_of(r["sport"], r["league"]), "league": r["league"] or "Not named yet"}
+                for r in self._store.results(self._mode, since, until)]
+        for tip in self._store.fancy_results(self._mode, since, until):
+            if tip["outcome"] == "void":
+                continue
+            known = tip["outcome"] in ("won", "lost")
+            stake = tip["units"] * unit
+            rows.append({"channel": tip["channel"], "sport": "Toss" if tip["kind"] == "toss" else "Fancy",
+                         "league": tip["league"] or "Not named yet", "stake": stake, "risk": stake,
+                         "closed": tip["outcome"] is not None, "measured": tip["site_pl"] is not None,
+                         "tip_pl": tip["pl"] * unit if known else None,
+                         "pl": (tip["site_pl"] if tip["site_pl"] is not None else tip["pl"]) * unit if known else None})
+        return [r for r in rows if self._is_running(r["channel"])]
+
+    def _limits_text(self) -> str:
+        """Match trades, fancy, toss, tennis and all in limits, over today, this week, this month and this year."""
+        periods = {period: self._results(period_start(period)) for period in PERIODS}
+
+        def line(title: str, sport: str = "") -> str:
+            return title + ": " + " · ".join(
+                f"{period} {sum(r['pl'] or 0 for r in rows if sport in ('', r['sport'])) / self._s.unit_stake:+.2f}"
+                for period, rows in periods.items())
+
+        return "\n".join(["📈 *Limits* (/report week: channels and leagues)", line("🏏 Match", "Cricket"),
+                          line("📐 Fancy", "Fancy"), line("🪙 Toss", "Toss"), line("🎾 Tennis", "Tennis"), line("All")])
+
+    async def daily_report(self) -> None:
+        """At DAILY_REPORT_AT every day: the day's trades of each channel in one message."""
+        if not (self._notifier and self._s.daily_report_at):
+            return
+        while True:
+            await asyncio.sleep(_seconds_until(self._s.daily_report_at))
+            await self._notifier.send(self.day_report_text())
+            await asyncio.sleep(61)  # past the minute, so it is sent once
+
+    def day_report_text(self, day: date | None = None) -> str:
+        day = day or datetime.now().date()
+        start = datetime.combine(day, datetime.min.time())
+        end = start + timedelta(days=1)
+        channels: dict[str, dict] = {}
+
+        def entry(name: str) -> dict:
+            unit = self._risk.cfg(name).unit_stake or self._s.unit_stake
+            return channels.setdefault(name, {"name": name or "-", "unit": unit, "trades": [], "missed": [],
+                                              "deleted": 0, "deleted_traded": 0, "fancy": []})
+
+        for name, selection, price, stake, closed, pl, how in self._store.day_trades(self._mode, start, end):
+            c = entry(name)
+            state = "open" if not closed else ("ended" if pl is None else
+                                               ("booked" if how in ("booked", None) else ("won" if pl > 0 else "lost")))
+            c["trades"].append({"selection": selection, "units": round(stake / c["unit"], 2),
+                                "price": round(price, 2) if price else price,
+                                "state": state, "pl": None if pl is None else pl / c["unit"]})
+        for name, description, reason in self._store.day_misses(self._mode, start, end):
+            tag = re.match(r"\[([^\]]+)\]", description or "")
+            name = name or (tag[1] if tag else "")
+            if (reason or "").startswith(("duplicate", "already")):
+                continue  # the same tip again, not a missed one
+            what = re.sub(r"^\[[^\]]+\]\s*", "", description or "").split(" [")[0]
+            entry(name or "-")["missed"].append(f"{what}: {(reason or '').replace('[live would ask: ', '[')[:90]}")
+        for name, (n, traded) in self._store.day_deleted(start, end).items():
+            c = entry(name)
+            c["deleted"], c["deleted_traded"] = n, traded
+        for name, team, kind, number, line, side, outcome, pl, note, site_pl in self._store.day_fancy(self._mode, start, end):
+            entry(name)["fancy"].append({"text": _fancy_text(team, kind, number, line, side), "outcome": outcome, "pl": pl,
+                                         "note": note or "", "site_pl": site_pl})
+        week = {r["channel"]: round((r["booked_pl"] + r["settled_pl"]) / (self._risk.cfg(r["channel"]).unit_stake
+                                                                         or self._s.unit_stake), 2)
+                for r in self._store.report(self._mode, period_start("week")) if self._is_running(r["channel"])}
+        for name, *_, pl, _note, site_pl in self._store.day_fancy(self._mode, period_start("week"), end):
+            if self._is_running(name):
+                week[name] = round(week.get(name, 0) + (site_pl if site_pl is not None else pl or 0), 2)
+        mode = "paper" if self._mode != "live" else "LIVE"
+        title = f"{day:%a %d %b} ({mode})"
+        shown = [c for c in channels.values() if self._is_running(c["name"]) and (c["name"] != MANUAL or c["trades"])]
+        report = day_report(title, shown, week, self._limits_text())
+        return f"{report}\n\n{self._jackpot_text()}" if self._store.is_jackpot_day(day) else report
+
     def status_text(self) -> str:
         counts = self._store.today_counts(self._mode)
         entries = counts.get(("entry", "placed"), 0) + counts.get(("entry", "simulated"), 0)
@@ -669,9 +1779,11 @@ class Pipeline:
         today = self._store.period_result(self._mode, period_start("day"))
         state = "⏸ PAUSED (no new entries)" if self._paused else "running"
         stop = self._risk.stop_reason()
+        ladders = self._ladders_text()
         return (f"✅ *Bot {state}* ({self._mode.replace('_', ' ')}), {_clock()}\n"
                 f"Today: {entries} entries, {booked} booked, {skipped} skipped, {failed} failed, "
-                f"result {today:+g}\n" + (f"⛔ {stop}\n" if stop else "") + f"Open trades:\n{trades}")
+                f"result {today:+g}\n" + (f"⛔ {stop}\n" if stop else "") + f"Open trades:\n{trades}"
+                + (f"\n{ladders}" if ladders else ""))
 
     async def check_finished_matches(self) -> None:
         """A trade's match missing from the site's list twice in a row has finished: the site settles it."""
@@ -689,12 +1801,52 @@ class Pipeline:
                 self._missing[pos.id] = self._missing.get(pos.id, 0) + 1
                 if self._missing[pos.id] < 2:
                     continue
-                self._store.set_closed(pos.id, how="finished")
-                self._missing.pop(pos.id, None)
-                log.info("MATCH FINISHED: %s (%s trade was not booked)", pos.event, pos.selection)
-                if self._notifier:
-                    await self._notifier.send(match_finished(pos, _clock()) + f"\nRecord its result: /settle {pos.id} "
-                                                                              f"win|lose")
+                await self._finish(pos)
+
+    async def _finish(self, pos: Position) -> None:
+        """The trade's match is over without a booking: closed, and settled from the last price seen."""
+        self._store.set_closed(pos.id, how="finished")
+        self._missing.pop(pos.id, None)
+        self._no_price.pop(pos.id, None)
+        log.info("MATCH FINISHED: %s (%s trade was not booked)", pos.event, pos.selection)
+        last = self._last_price.pop(pos.id, None)
+        outcome = result_from_price(pos, last)
+        if outcome:
+            note = f"\nSettled as a {outcome.upper()} from its last price {last:g}: {self._settle(pos.id, outcome)}" \
+                   f" Wrong? /settle {pos.id} win|lose"
+        else:
+            note = f"\nLast price {last:g}: result unclear." if last else ""
+            note += f"\nRecord its result: /settle {pos.id} win|lose"
+        log.info("  %s", note.strip().replace("\n", " | "))
+        if self._notifier:
+            await self._notifier.send(match_finished(pos, _clock()) + note)
+
+    async def edited(self, chat_id: int, tg_id: int, text: str) -> None:
+        """The channel changed a message's words: kept and logged, not acted on. A tip's first words are what it said
+        when it could still be taken; a later edit can only tell what was changed."""
+        channel = self._channels.for_chat(chat_id)
+        if channel is None:
+            return
+        first = self._store.mark_edited(channel.name, tg_id, text)
+        if first is not None:
+            log.info("EDITED by %s: msg %s %r -> %r", channel.name, tg_id, first[:150], text[:150])
+
+    async def deleted(self, chat_id: int, tg_ids: list[int]) -> None:
+        """The channel deleted messages: recorded, and you are told which of them the bot had acted on."""
+        channel = self._channels.for_chat(chat_id)
+        if channel is None:
+            return
+        found = self._store.mark_deleted(channel.name, tg_ids)
+        if not found:
+            return
+        lines = []
+        for tg_id, received, text in found:
+            did = self._store.decisions_on(channel.name, tg_id)
+            lines.append(f"• {received[11:16]} {text[:80]!r}" + (f" → bot: {', '.join(did)}" if did else ""))
+            log.info("DELETED by %s: msg %s [%s] %r%s", channel.name, tg_id, received[11:16], text[:80],
+                     f" (bot: {', '.join(did)})" if did else "")
+        if self._notifier:
+            await self._notifier.send(f"🗑 *{channel.name} deleted {len(found)} message(s)*\n" + "\n".join(lines))
 
     # --- Telegram ---------------------------------------------------------------------------------
 
@@ -732,8 +1884,16 @@ class Pipeline:
                 return await self._answer(name == "yes", int(args[0]))
             if name == "report":
                 return self._report(args[0] if args else "day")
+            if name == "today":
+                return self.day_report_text()
+            if name == "yesterday":
+                return self.day_report_text(datetime.now().date() - timedelta(days=1))
             if name == "settle":
                 return self._settle(int(args[0]), args[1])
+            if name == "sk":
+                return await self._sk_command(" ".join(args))
+            if name == "jackpot":
+                return self._jackpot_command(args)
             if name == "channels":
                 return self._channels_text()
             if name == "follow":
@@ -769,11 +1929,17 @@ class Pipeline:
         return f"#{number} {result.status.upper()}: {result.reason}"
 
     def _report(self, period: str) -> str:
-        if period not in ("day", "week", "month"):
-            raise ValueError("period must be day, week or month")
-        rows = self._store.report(self._mode, period_start(period))
-        title = f"({ {'day': 'today', 'week': 'this week', 'month': 'this month'}[period] }, {self._mode})"
-        return report_text(title, rows, self._s.unit_stake, self._store.unsettled(self._mode))
+        if period in PERIODS:
+            start, until, name = period_start(period), datetime.max, PERIODS[period]
+        elif dates := _date_range(period):
+            start, until, name = *dates, period
+        else:
+            raise ValueError("period must be day, week, month, year, or a date like 2026-10 or 2026-10-29")
+        since = f" from {LEDGER_START:%d %b %H:%M}" if start < LEDGER_START else ""
+        unsettled = [p for p in self._store.unsettled(self._mode)
+                     if self._is_running(p.channel) and p.opened_at >= LEDGER_START.isoformat()]
+        return results_report(f"({name}{since}, {self._mode})", [c.name for c in self._channels.all()],
+                              self._results(start, until), self._s.unit_stake, unsettled)
 
     def _settle(self, position_id: int, outcome: str) -> str:
         pos = self._store.position(position_id)
@@ -816,6 +1982,16 @@ class Pipeline:
                     return None
                 log.warning("msg %s: AI unreachable, retrying (%.0fs old)", msg.id, age)
                 await asyncio.sleep(3)
+            except RateLimitError as exc:  # a free tier's daily limit used up
+                log.error("msg %s MISSED: AI limit reached (%s): %r", msg.id, str(exc)[:200], msg.text[:80])
+                self._missed_by_limit += 1
+                now = datetime.now()
+                if self._notifier and now - self._last_limit_alert >= LIMIT_ALERT_EVERY:
+                    await self._notifier.send(
+                        f"❌ *{self._missed_by_limit} message(s) not read*: the AI's free limit is used up "
+                        f"(latest: {msg.text[:120]!r}). Reading goes on as the limit frees up.")
+                    self._last_limit_alert, self._missed_by_limit = now, 0
+                return None
 
     def _simulate(self, sig: BetSignal, check: Decision) -> BetResult:
         """Signals-only mode has no site, so entries are checked against the tipster's own price."""
@@ -832,11 +2008,12 @@ class Pipeline:
         self._store.log_bet(
             message_id, sig, self._mode, result.status, result.reason, result.price, result.stake, result.liability
         )
-        if sig.action == "entry" and not result.reason.startswith("TOP-UP"):
+        if sig.action == "entry" and sig.market != "fancy" and not result.reason.startswith("TOP-UP"):
             # under the site's own names when it gave them, so booksets and price checks find the trade later
             names = {k: v for k, v in (("selection", result.name), ("event", result.event)) if v}
             entry = sig.model_copy(update=names)
             self._last_entry[sig.channel] = (entry, result.status)
+            self._entries.setdefault(sig.channel, deque(maxlen=10)).append((entry, result.status))
             if result.status in COUNTED:
                 self._store.open_position(entry, self._mode, result.price, result.stake)
         elif sig.action == "exit" and result.status in COUNTED:
@@ -884,13 +2061,18 @@ async def run(signals_only: bool) -> None:
 
     transcriber = None
     if channels.any_voice():
-        if settings.openai_api_key:
+        if (settings.voice_provider or settings.ai_provider) == "groq" and settings.groq_api_key:
+            transcriber = Transcriber(settings.groq_api_key, groq=True)
+        elif settings.openai_api_key:
             transcriber = Transcriber(settings.openai_api_key, settings.transcribe_model)
         else:
-            log.warning("voice notes need OPENAI_API_KEY: they will be logged without their words")
+            log.warning("voice notes need OPENAI_API_KEY (or GROQ_API_KEY with AI_PROVIDER=groq): they will be "
+                        "logged without their words")
 
     notifier = Notifier(settings.alert_chat, settings.alerts)
     pipeline = Pipeline(settings, mode, bot, risk, store, notifier, channels)
+    if bot:
+        bot.resolve_name = pipeline._parser.resolve_name  # 'Tallon' -> the site's 'T Griekspoor'
     log.info("AI: %s | alerts to %s: %s", pipeline._parser.name, settings.alert_chat, "on" if settings.alerts else "off")
 
     def connected(client) -> None:
@@ -908,9 +2090,10 @@ async def run(signals_only: bool) -> None:
             await bot.start()
         await asyncio.gather(
             listen(settings, channels, store, pipeline.enqueue, pipeline.preload, CONTEXT_MESSAGES, connected,
-                   on_command, pipeline.new_chat, transcriber),
+                   on_command, pipeline.new_chat, transcriber, pipeline.deleted, pipeline.edited),
             pipeline.monitor(), pipeline.keep_alive(), pipeline.retry_pending_closes(),
-            pipeline.heartbeat(),
+            pipeline.heartbeat(), pipeline.daily_report(), pipeline.fancy_settler(), pipeline.long_hold_settler(),
+            pipeline.ladder_watcher(), pipeline.league_namer(),
         )
     finally:
         if bot:

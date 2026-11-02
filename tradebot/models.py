@@ -75,6 +75,9 @@ class BetSignal(AISignal):
     # The rules' spelling of the selection when the AI wrote it differently ('gea' for the AI's 'Gaea'):
     # the site is searched with both names, and nothing is placed when they point to different matches.
     aka: str = ""
+    # An entry held for its match (SK Astro's tips come hours early): tried from this time on, and the price when tipped
+    not_before: str = ""
+    tip_price: float | None = None
 
     def key(self) -> str:
         """Normalised identity used to spot the same tip posted twice."""

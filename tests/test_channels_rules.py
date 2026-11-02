@@ -2,12 +2,13 @@
 import asyncio
 import json
 import sqlite3
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from conftest import make_settings, signal
-from main import Pipeline, TradeLock
+from main import Pipeline, TradeLock, result_from_price
 from tradebot.channels import Channel, Channels, Profile, apply_aliases
 from tradebot.exchange_bot import BetResult, _best_index
 from tradebot.models import ParsedMessage
@@ -241,6 +242,12 @@ class FakeSite:
 
     async def cancel_waiting(self, pos):
         return 0.0
+
+    async def quote(self, sig):
+        return self.live
+
+    async def fancy_quote(self, event, session, side):
+        return None
 
 
 class GeaSite(FakeSite):
@@ -553,6 +560,123 @@ def test_a_voice_note_alone_is_context_not_an_instruction(store):
     assert site.calls == [("close", "Florian Broska", None)]
 
 
+SA_AUS = dict(event="South Africa v Australia", sport="cricket")
+BOTH_TEAMS = {"orders": [signal(selection="South Africa", odds=3.0, units=2, **SA_AUS),
+                         signal(selection="Australia", odds=4.0, units=1.5, **SA_AUS)]}
+
+
+def _trades_after_both_teams_tipped(store, settings, mode):
+    pipe, _, _ = make(store, Profile("cs", settings=settings), BOTH_TEAMS, live=4.0, mode=mode)
+    asyncio.run(pipe._handle(msg("orders")))
+    return store._db.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+
+
+def test_a_system_channel_backs_both_teams_on_paper(store):
+    """CricStatz's Test system: 'Back South Africa 2pts @ 3.0 / Back Australia 1.5pts @ 4.0'."""
+    assert _trades_after_both_teams_tipped(store, {"both_sides_in_match": True}, "dry_run") == 2
+
+
+def test_other_channels_stay_on_one_team(store):
+    assert _trades_after_both_teams_tipped(store, {}, "dry_run") == 1
+
+
+def test_both_teams_is_never_for_live(store):
+    assert _trades_after_both_teams_tipped(store, {"both_sides_in_match": True}, "live") == 1
+
+
+def test_a_long_waiting_order_reads_its_price_once_a_minute(store):
+    """Up to 5 days of Test match orders: every 10 s would keep the browser busy all that time."""
+    order = signal(selection="South Africa", odds=5.0, when_odds=5.0, units=2, **SA_AUS)
+    pipe, site, _ = make(store, Profile("cs", settings={"conditional_entry_min": 7200}), {"order": [order]}, live=3.0,
+                         mode="dry_run")
+
+    async def go():
+        await pipe._handle(msg("order"))
+        looks = len(site.calls)
+        await pipe.retry_pending_once()
+        assert len(site.calls) == looks + 1
+        await pipe.retry_pending_once()
+        assert len(site.calls) == looks + 1  # within the minute
+        pending_id = store.pending_instructions("dry_run")[0][0]
+        pipe._last_look[pending_id] = datetime.now() - timedelta(seconds=61)
+        await pipe.retry_pending_once()
+        assert len(site.calls) == looks + 2
+
+    asyncio.run(go())
+
+
+def test_a_short_waiting_order_still_reads_its_price_every_time(store):
+    order = signal(selection="South Africa", odds=5.0, when_odds=5.0, units=2, **SA_AUS)
+    pipe, site, _ = make(store, Profile("ss"), {"order": [order]}, live=3.0, mode="dry_run", conditional_entry_min=90)
+
+    async def go():
+        await pipe._handle(msg("order"))
+        looks = len(site.calls)
+        await pipe.retry_pending_once()
+        await pipe.retry_pending_once()
+        assert len(site.calls) == looks + 2
+
+    asyncio.run(go())
+
+
+def test_if_enter_bookset_is_a_close_now(store):
+    """SK Astro 31 Oct 11:27: dropped as a bookset still to come because of its 'if'."""
+    script = {"If Enter Bookset": [signal(action="close", odds=None)]}
+    pipe, site, _ = make(store, Profile("sk"), script)
+    store.open_position(signal(channel="Tip"), "live", 2.9, 1000)
+    asyncio.run(pipe._handle(msg("If Enter Bookset")))
+    assert site.calls == [("close", "Florian Broska", None)]
+
+
+def test_a_voice_note_acts_when_the_channel_says_so(store):
+    """SS gives most exits in Tamil voice notes. Only a confident reading acts; plain talk doesn't reach the AI."""
+    now = "(voice note) அதையே profit ஆருந்தா loss cut பண்ணிக்கோங்க."
+    coming = "(voice note) புக்செட் ரெடியா இருக்குங்கள். சொல்றேன் சொல்றேன்."
+    unsure = "(voice note) bookset பண்ணிடுங்க"
+    talk = "(voice note) நல்ல match, பாத்துக்கலாம்"
+    close = signal(action="close", odds=None)
+    script = {now: [close], coming: [close], unsure: [signal(action="close", odds=None, confidence=0.6)]}
+    pipe, site, _ = make(store, Profile("ss", voice=True, act_on_voice=True, entry_words=r"\b(back)\b"), script)
+    store.open_position(signal(channel="Tip"), "live", 2.9, 1000)
+
+    async def go():
+        await pipe._handle(msg(talk, voice=True))
+        assert pipe._parser.calls == 0
+        await pipe._handle(msg(coming, voice=True))
+        await pipe._handle(msg(unsure, voice=True))
+        assert site.calls == []
+        await pipe._handle(msg(now, voice=True))
+
+    asyncio.run(go())
+    assert site.calls == [("close", "Florian Broska", None)]
+
+
+def test_voice_talk_about_a_later_bookset_books_nothing(store):
+    """SS's old notes the AI read as a close: a price, an over, or 'should' still to come."""
+    notes = ["(voice note) 1.8 அந்த Rangeன்னா நம்ம புக்க்செட் பண்ணினா போதும்.",
+             "(voice note) விக்கெட் போய்ட்டுச்சு அப்படின்னா, 1.9, 1.8 ரேஞ்ச்ல வந்தாலும் லாஸ்கட் பண்ணிடுங்க.",
+             "(voice note) 35ஆவது ஓவர்லே நம bookset பண்ணியனும்.",
+             "(voice note) Bookset கண்டிப்பா லோவான் தான் புக்க்சட் பண்ணனும்."]
+    script = {note: [signal(action="close", odds=None)] for note in notes}
+    pipe, site, _ = make(store, Profile("ss", voice=True, act_on_voice=True), script)
+    store.open_position(signal(channel="Tip"), "live", 2.9, 1000)
+
+    async def go():
+        for note in notes:
+            await pipe._handle(msg(note, voice=True))
+
+    asyncio.run(go())
+    assert site.calls == []
+
+
+def test_a_voice_entry_is_only_logged(store):
+    spoken = "(voice note) இப்போ ஒரு limit இந்தியா back பண்ணிக்கோங்க"
+    script = {spoken: [signal(selection="India", event="India v ?", odds=None, units=1)]}
+    pipe, site, _ = make(store, Profile("ss", voice=True, act_on_voice=True), script)
+    asyncio.run(pipe._handle(msg(spoken, voice=True)))
+    assert site.calls == []
+
+
 def test_entries_need_an_entry_word_and_bookings_not_yet_are_dropped(store):
     script = {"Sl 1.2 coming": [signal(odds=1.2, selection="Sri Lanka", event="Sri Lanka v ?")],
               "Sl back 5.7 odds": [signal(odds=5.7, selection="Sri Lanka", event="Sri Lanka v ?")],
@@ -598,6 +722,110 @@ def test_no_close_when_the_latest_entry_was_not_placed(store):
     assert store.find_position("Zimbabwe", "live") is not None
 
 
+def test_a_close_after_a_skipped_re_entry_books_the_open_trade(store):
+    """Tennis Tv 22 Oct: Uchijima entry placed, '35P entry kr lena' skipped (already in it), then 'LOSS CUT ONLY'."""
+    uchi = dict(selection="Moyuka Uchijima", event="Moyuka Uchijima v ?")
+    script = {"UCHIJIMA Win Karo": [signal(odds=2.5, **uchi)], "35P ENTRY KR LENA": [signal(odds=1.35, **uchi)],
+              "LOSS CUT ONLY": [signal(action="close", odds=None, loss_cut=True, selection="Mary Stoiana",
+                                       event="Mary Stoiana v ?")]}
+    pipe, site, _ = make(store, Profile("tv"), script, live=2.5)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    # '35P entry' at once is the same entry (a re-entry needs the trade 10 min old), so skipped: already in it
+    assert site.calls == [("entry", "Moyuka Uchijima", None), ("close", "Moyuka Uchijima", None)]
+
+
+def test_add_tops_up_the_open_trade(store):
+    """SS 22 Oct: '4.3 odds ind back 0.5 limit', then 'Add one more 1 limit'."""
+    ind = dict(selection="India", event="India v New Zealand", sport="cricket")
+    script = {"4.3 odds ind back 0.5 limit": [signal(odds=4.3, units=0.5, **ind)],
+              "Add one more 1 limit": [signal(action="add", odds=None, units=1, **ind)]}
+    pipe, site, _ = make(store, Profile("ss"), script, live=4.3)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "India", 0.5), ("entry", "India", 1000)]  # 1 unit more, at 1000 a unit
+    assert store.find_position("India", "live").stake == 1500
+
+
+def test_again_bookset_closes_the_earlier_open_trade(store):
+    """SS 22 Oct: India trade open, a newer Sri Lanka entry, then 'Again bookset enjoy' about India."""
+    script = {"4.4 odds back ind": [signal(odds=4.4, units=0.5, selection="India", event="India v New Zealand")],
+              "7.6 odds sl back limit 0.5": [signal(odds=4.4, units=0.5, selection="Sri Lanka",  # the fake site's price
+                                                    event="England v Sri Lanka")],
+              "Again bookset enjoy": [signal(action="close", odds=None, selection="India",
+                                             event="India v New Zealand")]}
+    pipe, site, _ = make(store, Profile("ss"), script, live=4.4)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls[-1] == ("close", "India", None)
+    assert store.find_position("Sri Lanka", "live") is not None
+
+
+def test_again_bookset_never_books_the_newest_trade_when_the_re_entry_was_skipped(store):
+    """SS 22 Oct as replayed: India booked, its green-money re-entry skipped, Sri Lanka entered, then 'Again
+    bookset enjoy' (India's second trade, by the tipster's day summary) read by the AI as Sri Lanka."""
+    ind = dict(selection="India", event="India v New Zealand")
+    script = {"4.3 odds ind back 0.5 limit": [signal(odds=4.4, units=0.5, **ind)],
+              "Losscut": [signal(action="close", odds=None, loss_cut=True, **ind)],
+              "4.4 odds back ind green money only 10% or 15% try": [signal(odds=4.4, green_pct=10, **ind)],
+              "7.6 odds sl back limit 0.5": [signal(odds=4.4, units=0.5, selection="Sri Lanka",
+                                                    event="England v Sri Lanka")],
+              "Again bookset enjoy": [signal(action="close", odds=None, selection="Sri Lanka",
+                                             event="England v Sri Lanka")]}
+    pipe, site, _ = make(store, Profile("ss"), script, live=4.4)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls[-1] == ("entry", "Sri Lanka", 0.5)  # no close after it
+    assert store.find_position("Sri Lanka", "live") is not None
+
+
+def test_a_deleted_tip_is_recorded_and_reported(store):
+    """Tennis Tv 23 Oct deleted every losing tip after the match: the bot keeps them and tells you."""
+    pipe, site, notifier = make(store, Profile("tv"), {"BEJLEK Win Karo": [signal(odds=2.0)]}, live=2.0)
+    asyncio.run(pipe._handle(msg("BEJLEK Win Karo")))
+    asyncio.run(pipe.deleted(CHAT, [1, 999]))  # 999: never received
+    assert "deleted 1 message" in notifier.sent[-1] and "ENTRY placed" in notifier.sent[-1]
+    assert store.rows("SELECT COUNT(*) FROM messages WHERE deleted_at IS NOT NULL")[0][0] == 1
+
+
+def test_the_daily_report_lists_each_channels_trades(store):
+    pipe, _, _ = make(store, Profile("tv"))
+    store.open_position(signal(selection="Bejlek", event="Bejlek v ?", channel="Tip"), "live", 2.32, 2700)
+    store.open_position(signal(selection="Kawa", event="Kawa v ?", channel="Tip"), "live", 3.85, 1800)
+    bejlek = store.find_position("Bejlek", "live")
+    store.set_closed(bejlek.id, how="finished")
+    store.settle(bejlek.id, -2700)
+    text = pipe.day_report_text()
+    assert "*Tip*: -2.70u" in text and "Bejlek 2.7u @ 2.32 → -2.70u (lost at the end)" in text
+    assert "Kawa 1.8u @ 3.85 → open" in text and "⏳ 1 open" in text
+
+
+def test_a_trade_left_to_the_end_settles_from_its_last_price(store):
+    store.open_position(signal(selection="Jarry", event="Jarry v ?"), "live", 1.89, 60)
+    back = store.find_position("Jarry", "live")
+    assert result_from_price(back, 1.02) == "win"
+    assert result_from_price(back, 25.0) == "lose"
+    assert result_from_price(back, 1.6) == ""  # not clear: /settle by hand
+    assert result_from_price(back, None) == ""
+    assert result_from_price(replace(back, side="lay"), 1.02) == "lose"  # laid the runner that won
+
+
 def test_a_stake_in_rupees_completes_the_held_entry(store):
     script = {"8 odds back war": [signal(odds=8.0, **dict(KG, selection="Warriors", event="Warriors v ?"))],
               "Try 200 or 300": [signal(action="stake", odds=None, amount=200, selection="Warriors")]}
@@ -609,6 +837,26 @@ def test_a_stake_in_rupees_completes_the_held_entry(store):
 
     asyncio.run(go())
     assert site.calls == [("entry", "Warriors", 200)]
+
+
+def test_the_tipsters_rupees_become_units(store):
+    script = {"8 odds back war": [signal(odds=8.0, **dict(KG, selection="Warriors", event="Warriors v ?"))],
+              "Try 200 or 300": [signal(action="stake", odds=None, amount=200, selection="Warriors")]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss", stake_wait_s=5, rupees_per_unit=1000), script, live=8.0)
+
+    async def go():
+        await pipe._handle(msg("8 odds back war"))
+        await pipe._handle(msg("Try 200 or 300"))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "Warriors", 0.2)]  # 200 of the tipster's 1000-rupee unit
+
+
+def test_a_tip_above_the_most_units_is_capped_not_skipped(store):
+    script = {"Back x": [signal(odds=3.0, units=2.8)]}
+    pipe, site, _ = make(store, Profile("tip", settings={"max_units_per_bet": 2}), script, live=3.0)
+    asyncio.run(pipe._handle(msg("Back x")))
+    assert [units for _, _, units in site.calls] == [2]
 
 
 TENNIS_TV_TIP = ("🎾 Live Running Tennis Match 🎾\n\nSHEVCHENKO Win Karo...🏆\n\nPlay Smartly 👍\nPlay In Limit 👍\n\n"
@@ -652,6 +900,241 @@ def test_an_entry_must_name_its_team(store):
 
     asyncio.run(go())
     assert site.calls == [("entry", "Sebastian Baez", None)]
+
+
+def test_an_unnamed_entry_takes_the_team_of_an_earlier_tip(store):
+    """Tennis King Free 26 Oct: 'Navone WIN KRO' came before the bot restarted (context only), then
+    '18p se entry kro guys'."""
+    script = {"18p se entry kro guys": [signal(odds=1.18, selection="Mariano Navone", event="Navone v ?")]}
+    pipe, site, _ = make(store, Profile("tv", entry_words=r"(win kro|entry)"), script, live=1.18)
+    pipe.preload([msg("80p Darderi FAV / KHAOOOO / Navone WIN KRO")])
+    asyncio.run(pipe._handle(msg("18p se entry kro guys")))
+    assert site.calls == [("entry", "Mariano Navone", None)]
+
+
+def test_texts_without_instruction_words_skip_the_ai(store):
+    """Free AI tier: 'Good morning', zone lists and result chatter aren't sent to the AI; tips and closes are."""
+    pipe, site, _ = make(store, Profile("ss", ai_filter=True), {"Losscut must": [signal(action="close", odds=None)]})
+
+    async def go():
+        for text in ("Good morning 🙏", "1 to 3 over afg \n4 to 13 over zim", "S-AYUB 06 RUN BANAKER OUT ✔️",
+                     "Losscut must"):
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert pipe._parser.calls == 1  # only "Losscut must"
+
+
+def test_photos_without_instruction_words_skip_the_ai(store):
+    """Kartik Bhai 27 Oct: an album of ~100 result photos used up the free AI. A bare photo, or one whose caption
+    has no instruction word, isn't read; a captioned tip is."""
+    pipe, site, _ = make(store, Profile("kb", ai_filter=True, bare_photos=False),
+                         {"68P - ENGLAND Khaooo": [signal(odds=1.68)]})
+
+    def photo(text):
+        return IncomingMessage(id=1, date=datetime.now(timezone.utc), text=text, image=b"jpeg", chat_id=CHAT)
+
+    async def go():
+        for text in ("", "🏆 PAKISTAN PASS 🏆", "68P - ENGLAND Khaooo"):
+            await pipe._handle(photo(text))
+
+    asyncio.run(go())
+    assert pipe._parser.calls == 1
+
+
+def test_a_lay_on_the_channels_open_back_books_it(store):
+    """Tennis Tips King 27 Oct: 'Rublev win karo', then '60P LAY KARO Rublev' = trade out of it."""
+    rublev = dict(selection="Andrey Rublev", event="Andrey Rublev v ?")
+    script = {"Rublev win karo": [signal(odds=2.0, **rublev)],
+              "60P LAY KARO Rublev": [signal(odds=1.6, side="lay", **rublev)]}
+    pipe, site, _ = make(store, Profile("tk"), script, live=2.0)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "Andrey Rublev", None), ("close", "Andrey Rublev", None)]
+
+
+def test_a_lay_at_the_other_runners_price_adds_to_the_back(store):
+    """Tennis Tips King 31 Oct: 'Adolfo PLUS KARO', then '45P LAY KARO, Adolfo PLUS KARO' read as a lay of Adolfo, who is
+    3.2 by then: the favourite is laid at 1.45. More of the trade, sized as that lay; booking it locked -212."""
+    adolfo = dict(selection="Adolfo", event="Adolfo v ?")
+    script = {"Adolfo PLUS KARO": [signal(odds=None, **adolfo)],
+              "45P LAY KARO": [signal(odds=1.45, side="lay", **adolfo)]}
+    pipe, site, _ = make(store, Profile("tk"), script, live=3.2)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "Adolfo", None), ("entry", "Adolfo", 450)]
+    assert store.find_position("Adolfo", "live").stake == 1450
+
+
+def test_a_call_for_those_not_in_yet_adds_nothing(store):
+    """Tennis Professor 31 Oct: 'Hugo win karo', then '50p h jiska entry nahi hua hai kar lo' doubled the stake."""
+    hugo = dict(selection="Hugo", event="Hugo v ?")
+    script = {"Hugo win karo": [signal(odds=None, **hugo)],
+              "50p h jiska entry nahi hua hai kar lo": [signal(odds=1.5, **hugo)]}
+    pipe, site, _ = make(store, Profile("tk"), script, live=2.5)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "Hugo", None)]
+    assert store.find_position("Hugo", "live").stake == 1000
+
+
+def test_your_own_telegram_channel_is_followed_by_its_title():
+    """You make a private Telegram channel and post your tips there: its title is enough, no id to copy."""
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "channels.example.json"
+    channels = Channels.load(make_settings(), path)
+    assert channels.by_title("MY Tips").name == "MY Tips"
+    assert channels.by_title("WA Tamil Sports") is None
+
+
+def test_your_own_post_in_a_followed_channel_is_read_as_its_tip(store):
+    pipe, site, _ = make(store, Profile("wa", pasted=True), {"Back x": [signal(odds=3.0)]}, mode="dry_run")
+    asyncio.run(pipe._handle(msg("Back x")))
+    assert site.calls == [("entry", "Florian Broska", None)]
+
+
+def test_a_close_naming_the_other_team_closes_the_trade_in_that_match(store):
+    """Tamil Sports 1 Nov: 'BACKED INDIA 3.05', then 'Loss cut @1.74 NZ': the team named is where the price is."""
+    match = dict(event="India v New Zealand", sport="cricket")
+    script = {"BACKED INDIA 3.05": [signal(selection="India", odds=3.05, **match)],
+              "Loss cut @1.74 NZ": [signal(action="close", selection="New Zealand", side="lay", odds=1.74, loss_cut=True,
+                                           **match)]}
+    pipe, site, _ = make(store, Profile("wa"), script, live=3.05)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls[-1] == ("close", "India", None) and store.find_position("India", "live") is None
+
+
+def test_david_reports_entries_are_read_by_rule():
+    """1 Nov: the AI found nothing in '59 india / Lay-60% / NEWZLEAND plus', his usual entry."""
+    from tradebot.rules import parse_known
+    (sig,) = parse_known("59 india\n\nLay-60% \n\n *NEWZLEAND plus*", "david")
+    assert (sig.action, sig.selection, sig.side, sig.odds, sig.units) == ("entry", "India", "lay", 1.59, 0.6)
+    assert sig.event == "India v Newzleand"
+    (sig,) = parse_known("WBBL \nHobartw -50p\nUse 60% limit \n\n *Sixers plus*", "david")
+    assert (sig.selection, sig.side, sig.odds, sig.units) == ("Hobartw", "lay", 1.5, 0.6)
+    assert parse_known("NEWZLEAND VS INDIA 5TH T20I\n\nNEWZLEAND WIN OR 37P", "david") is None
+    assert parse_known("Wait no ball", "david") is None
+    (sig,) = parse_known("Now loss cut", "david")
+    assert sig.action == "close" and sig.loss_cut
+
+
+def test_a_call_before_the_entry_is_no_trade(store):
+    """David Reports 1 Nov: 'NEWZLEAND WIN OR 37P' was read as a back at 3.7; '59 india / Lay-60% / NEWZLEAND plus' is the entry."""
+    nz = dict(event="New Zealand v India", sport="cricket")
+    script = {"NEWZLEAND WIN OR 37P": [signal(selection="New Zealand", odds=3.7, **nz)],
+              "59 india Lay-60% NEWZLEAND plus": [signal(selection="India", side="lay", odds=1.59, units=0.6, **nz)]}
+    pipe, site, _ = make(store, Profile("wa", entry_words="(lay|limit|plus)"), script, live=1.59, mode="dry_run")
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "India", 0.6)]
+
+
+def test_only_the_new_lines_of_a_pasted_block_are_tips():
+    """1 Nov: a block of WhatsApp posts from 29 Oct on, copied together, each stamped '[10/29, 9:56 AM] null: '."""
+    from datetime import timedelta
+    from tradebot.rules import fresh_part_of_paste
+    now, within = datetime(2026, 11, 1, 14, 4), timedelta(minutes=3)
+    block = ("[10/29, 9:56 AM] null: Backed Melbourne  Renegades 30% stake @2.74\n"
+             "[11/1, 1:07 PM] +91 98765 43210: *Loss cut* @1.74 NZ\n"
+             "[11/1, 2:03 PM] null: Backed Sydney 2.08\n\n50% stake\n"
+             "[11/1, 2:04 PM] null: Back another 50% @4")
+    assert fresh_part_of_paste(block, now, within) == "Backed Sydney 2.08\n\n50% stake\nBack another 50% @4"
+    assert fresh_part_of_paste("[11/1, 1:07 PM] null: Loss cut", now, within) == ""
+    assert fresh_part_of_paste("Backed Sydney 2.08", now, within) == "Backed Sydney 2.08"  # one message has no stamp
+    assert fresh_part_of_paste("[11/1, 12:02 PM] null: x", datetime(2026, 11, 1, 12, 3), within) == "x"  # noon is PM
+
+
+def test_a_block_of_old_posts_is_kept_but_never_traded(store):
+    old = "[10/29, 9:56 AM] null: Back x"
+    now = datetime.now()
+    new = f"[{now.month}/{now.day}, {now.hour % 12 or 12}:{now.minute:02d} {'PM' if now.hour >= 12 else 'AM'}] null: Back x"
+    pipe, site, _ = make(store, Profile("wa", pasted=True), {"Back x": [signal(odds=3.0)]}, mode="dry_run")
+    asyncio.run(pipe._handle(msg(old)))
+    assert site.calls == []
+    assert store._db.execute("SELECT summary FROM messages").fetchone()[0].startswith("pasted history")
+    asyncio.run(pipe._handle(msg(new)))
+    assert site.calls == [("entry", "Florian Broska", None)]
+
+
+def test_fav_bookset_books_the_channels_trade(store):
+    """SS 1 Nov: 'Fav bookset' looked for a team called Fav and failed, leaving the trade open 48 min more."""
+    heat = dict(selection="Brisbane Heat W", event="Brisbane Heat W v ?", sport="cricket")
+    script = {"3.3 odds back bh": [signal(odds=3.3, units=0.5, **heat)],
+              "Fav bookset": [signal(action="close", odds=None, **heat)]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss"), script, live=3.3)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert site.calls[-1] == ("close", "Brisbane Heat W", None)
+    assert store.find_position("Brisbane Heat W", "live") is None
+
+
+def test_a_low_confidence_add_adds_nothing(store):
+    """SS 1 Nov: '3.3 odds back bh', 'Add 0.5 again. Limit', then '3.7' alone, read as one more add at confidence 0.40."""
+    heat = dict(selection="Brisbane Heat W", event="Brisbane Heat W v ?", sport="cricket")
+    script = {"3.3 odds back bh": [signal(odds=3.3, units=0.5, **heat)],
+              "3.7": [signal(action="add", odds=3.7, confidence=0.4, **heat)]}
+    pipe, site, _ = make(store, Profile("ss"), script, live=3.3)
+
+    async def go():
+        for text in script:
+            await pipe._handle(msg(text))
+
+    asyncio.run(go())
+    assert len(site.calls) == 1 and store.find_position("Brisbane Heat W", "live").stake == 500
+
+
+def test_book_set_compulsory_in_an_entry_is_no_close(store):
+    """Tennis Expert 1 Nov: 'Leylah WIN KRO / BOOK SET COMPALSARY' read as both: the trade was booked 5 s after it opened."""
+    leylah = dict(selection="Leylah Fernandez", event="Leylah Fernandez v ?")
+    script = {"Leylah WIN KRO": [signal(odds=None, **leylah), signal(action="close", odds=None, **leylah)]}
+    pipe, site, _ = make(store, Profile("tk"), script, live=6.6)
+    asyncio.run(pipe._handle(msg("Leylah WIN KRO")))
+    assert site.calls == [("entry", "Leylah Fernandez", None)]
+
+
+def test_on_paper_each_channels_trades_are_its_own(store):
+    """Paper: SK Astro's Sri Lanka trade must not block Kartik's Pakistan tip in the same match; live it does
+    (the site holds one position per match)."""
+    for mode in ("dry_run", "live"):
+        store.open_position(signal(selection="Sri Lanka", event="Pakistan v Sri Lanka", sport="cricket",
+                                   channel="SK Astro"), mode, 2.78, 1000)
+        tip = signal(selection="Pakistan", event="Pakistan v Sri Lanka", sport="cricket", channel="Kartik",
+                     odds=1.55)
+        decision = RiskManager(make_settings(), store, mode).precheck(tip)
+        assert decision.ok == (mode == "dry_run"), decision.reason
+
+
+def test_first_names_and_initials_find_the_player():
+    """Tennis Tips King 28 Oct 'Tallon v Brandon'; Raftaar 'NAKASHIMA B'."""
+    from tradebot.exchange_bot import _first_name_of
+    listed = ["Tallon Griekspoor v Brandon Nakashima", "Le Tien v Alex de Minaur"]
+    assert _best_index(listed, "Tallon v Brandon", "Tallon") == 0
+    assert _first_name_of("Brandon", "Brandon Nakashima") and not _first_name_of("Nakashima", "Brandon Nakashima")
 
 
 def test_messages_from_other_chats_are_ignored(store):

@@ -27,6 +27,12 @@ RUNNER_BOOK = "div.text-ellipsis + div span"
 PRICE_CELL = "div.bl-box"
 SUSPENDED_TEXT = "SUSPENDED"
 
+# Fancy rows on the match page ('15 Over MLSW'): the same grid with a bold name and two boxes NO | YES, each its line
+# over its rate (128 / 100). An overlay says BALL RUNNING while the row takes no bets. Confirmed on a saved page, 31 Oct.
+FANCY_ROW = "div.grid.grid-cols-12:has(div.bl-box):has(div.font-bold)"
+FANCY_NAME = "div.font-bold"
+FANCY_CLOSED = ".ball-start-overly"
+
 # Bet slip (blue for back, pink for lay). It exists twice (inline for narrow screens, side panel for
 # wide ones), so the bot uses the visible one. Fields below are searched inside it.
 BET_SLIP = 'div.rounded-b-md:has(input[min="1.01"])'

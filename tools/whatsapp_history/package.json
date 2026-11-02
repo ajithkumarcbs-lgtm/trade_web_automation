@@ -1,0 +1,11 @@
+{
+  "name": "whatsapp-history",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reads a WhatsApp channel's or group's past messages once, for the same audit as the Telegram channels. Never sends anything.",
+  "main": "history.js",
+  "dependencies": {
+    "qrcode-terminal": "0.12.0",
+    "whatsapp-web.js": "1.34.7"
+  }
+}

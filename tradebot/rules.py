@@ -12,6 +12,8 @@ Anything else (chat, results, narrative) returns None here and is left to the AI
 from __future__ import annotations
 
 import re
+import unicodedata
+from datetime import datetime, timedelta
 
 from .models import AISignal, BetSignal, as_bet
 from .names import same_name
@@ -27,7 +29,8 @@ _STRICT_CLOSE = re.compile(r"^/?(?P<cmd>bookset|book\s*set|losscut|loss\s*cut|ca
 
 # Words that can't be a player or team name in a rule match: nicknames and filler go to the AI instead.
 NOT_NAMES = {"goat", "karupan", "now", "try", "first", "entry", "the", "my", "again", "only", "high", "odds",
-             "back", "lay", "limit", "unit", "units", "green", "money", "small", "amount", "risky", "jackpot"}
+             "back", "lay", "limit", "unit", "units", "green", "money", "small", "amount", "risky", "jackpot", "fav",
+             "favourite", "favorite"}
 
 
 def normalise(text: str) -> str:
@@ -103,6 +106,23 @@ SS_MONEY_STAKE = re.compile(r"^(?:try |rs ?|₹ ?)+(?P<a>\d{2,5})(?: or (?:rs ?|
 # = back Shevchenko with 1.7 units to win 4: odds 1 + 4 / 1.7.
 TV_NAME = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z .'-]{1,30}?)\s+win karo", re.IGNORECASE | re.MULTILINE)
 TV_STAKE = re.compile(r"(?P<a>\d+(?:\.\d+)?)\s*limit use kro\s*(?P<b>\d+(?:\.\d+)?)\s*limit rhega", re.IGNORECASE)
+# David Reports: '59 india / Lay-60% / NEWZLEAND plus', 'WBBL / Hobartw -50p / Use 60% limit / Sixers plus' = lay the favourite
+DAVID_ENTRIES = [
+    r"^(?:[a-z0-9]+ )?(?P<odds>\d{2}) ?p? (?P<name>[a-z ]+?) lay (?P<pct>\d{1,3})% (?P<other>[a-z ]+?) plus$",
+    r"^(?:[a-z0-9]+ )?(?P<name>[a-z ]+?) (?P<odds>\d{2}) ?p? use (?P<pct>\d{1,3})% limit (?P<other>[a-z ]+?) plus$",
+]
+# The user's own channel: 'India win', 'India Match Win', 'IND vs NZ / India win', 'IND vs NZ India win 3 limit'
+MY_ENTRY = re.compile(r"^\s*(?:.*\bvs?\.?\s+\S+\s+)?(?P<name>[A-Za-z][A-Za-z .]*?)\s+(?:(?:toss|even)\s+or\s+)?(?:match\s+)?win\b",
+                      re.IGNORECASE | re.MULTILINE)
+# SK Astro's calls: 'UAE Toss or Match Win', 'Sri Lanka Even or Win', 'IND Even or 50p', 'Eng win or Bookset'. A line that ends
+# in a tick is a result: 'Sydney Match Win ✅' (the pipeline asks whether its match is still to come)
+SK_ENTRY = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z .]*?)\s+(?:(?:toss\s+or\s+)?match\s+win|even\s+or\s+(?:win|\d+\s*p)|"
+                      r"win\s+or\s+(?:even|bookset))[ \t]*$", re.IGNORECASE | re.MULTILINE)
+# PANTHER TOSS: 'TOSS 👉 #SYDNEY_THUNDER_W', 'TOSS WINNER : #Sydney Sixers', 'Next 3 Match Tosses / 1. NZ / 2. IRELAND'
+TOSS_CALL = re.compile(r"\btoss(?:\s+winner)?\s*(?:👉|:)\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.IGNORECASE)
+TOSS_LIST_ITEM = re.compile(r"^\s*\d+\.\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.MULTILINE)
+TOSS_NAMES = {"newzealand": "new zealand", "srilanka": "sri lanka", "westindies": "west indies", "southafrica": "south africa",
+              "melbourne r": "melbourne renegades", "melbourne star": "melbourne stars"}
 CLOSE_WORDS = r"(?P<word>bookset|book set|boookset|bookser|losscut|loss cut|cashout|book pannuga|book pannunga)"
 # "Bookset coming", "Ready for bookset", "Japan trade possible ... boookset": not yet
 # "Cashout khudse kr lena" (cash out yourself): the tipster gives no exit, so no close either
@@ -116,10 +136,39 @@ def _units(value: str | None) -> float | None:
     return {"one": 1.0, "half": 0.5}.get(value, None) if not value[0].isdigit() else float(value)
 
 
+def _toss_team(name: str) -> str:
+    team = " ".join(name.replace("_", " ").lower().split())
+    for joined, spaced in TOSS_NAMES.items():
+        team = re.sub(rf"\b{joined}\b", spaced, team)
+    return team.upper() if len(team) <= 3 else team.title()
+
+
+def _toss_calls(text: str) -> list[BetSignal] | None:
+    """Each team called for the toss, a paper bet at his stake: '5 % of your limit', 'small limit' (10%, his own word),
+    else the 5% he always says. His 'WON THE TOSS AND OPTED...', 'Today 3/4 Toss' and 'Pass' are results."""
+    plain = unicodedata.normalize("NFKC", text)  # his title is in mathematical bold letters
+    teams = [m["team"] for m in TOSS_CALL.finditer(plain)]
+    if not teams and re.search(r"\btosses\b", plain, re.IGNORECASE):
+        teams = [m["team"] for m in TOSS_LIST_ITEM.finditer(plain)]
+    if not teams:
+        return None
+    share = re.search(r"(\d{1,2})\s*%", plain)
+    units = int(share[1]) / 100 if share else 0.1 if re.search(r"\bsmall\b", plain, re.IGNORECASE) else 0.05
+    return [BetSignal(action="entry", sport="cricket", event=f"{_toss_team(team)} v ?", market="fancy", market_name="Toss",
+                      selection=_toss_team(team), side="yes", odds=None, line=None, units=units, amount=None,
+                      loss_cut=False, confidence=1.0) for team in teams]
+
+
 def parse_known(text: str, rules: str) -> list[BetSignal] | None:
     """A signal when the message is exactly one of the tipster's usual formats, else None."""
     if not rules:
         return None
+    if rules == "panther_toss":
+        return _toss_calls(text)
+    if rules == "sk" and (calls := [m["name"].strip() for m in SK_ENTRY.finditer(text)]):
+        return [_signal("entry", name, "back") for name in calls]
+    if rules == "mine" and (m := MY_ENTRY.search(text)):
+        return [_signal("entry", m["name"].strip().title(), "back")]
     if rules == "tennistv" and (name := TV_NAME.search(text)) and (stake := TV_STAKE.search(text)):
         units, wins = float(stake["a"]), float(stake["b"])
         if units > 0:
@@ -136,6 +185,12 @@ def parse_known(text: str, rules: str) -> list[BetSignal] | None:
                 return None  # a nickname or filler word: the AI knows who is meant
             odds = float(m["odds"]) if m.groupdict().get("odds") else None
             return [_signal("entry", name, "back", odds, _units(m.groupdict().get("units")))]
+    if rules == "david":
+        for pattern in DAVID_ENTRIES:
+            if m := re.match(pattern, line):
+                name = m["name"].strip().title()
+                sig = _signal("entry", name, "lay", round(1 + int(m["odds"]) / 100, 2), int(m["pct"]) / 100)
+                return [sig.model_copy(update={"event": f"{name} v {m['other'].strip().title()}"})]
     if rules == "ss":
         for pattern in SS_STAKES:
             if m := re.match(pattern, line):
@@ -178,9 +233,38 @@ def name_words(text: str) -> list[str]:
     return [w for w in words if w not in NAME_STOPWORDS and w not in NAME_SHORT_STOPWORDS and len(w) >= 2]
 
 
+PASTE_STAMP = re.compile(r"^\[(\d{1,2})/(\d{1,2}),\s*(\d{1,2}):(\d{2})\s*([AP]M)\]\s*[^:\n]*:[ \t]*",
+                         re.IGNORECASE | re.MULTILINE)  # '[11/1, 1:22 PM] +91 98765 43210: '
+
+
+def _stamp_time(stamp: re.Match, now: datetime) -> datetime | None:
+    month, day, hour, minute = (int(stamp[i]) for i in range(1, 5))
+    hour = hour % 12 + (12 if stamp[5].upper() == "PM" else 0)
+    try:
+        return datetime(now.year, month, day, hour, minute)
+    except ValueError:
+        return None
+
+
+def fresh_part_of_paste(text: str, now: datetime, within: timedelta) -> str:
+    """WhatsApp messages copied together come stamped ('[11/1, 1:22 PM] name: 59 india'). Only those of the last `within`
+    are tips now, returned without their stamps; '' when none is. Text with no stamp is one message pasted as it came."""
+    stamps = list(PASTE_STAMP.finditer(text))
+    if not stamps:
+        return text
+    fresh = []
+    for stamp, after in zip(stamps, [*stamps[1:], None]):
+        when = _stamp_time(stamp, now)
+        if when and abs(now - when) <= within:
+            fresh.append(text[stamp.end():after.start() if after else len(text)].strip())
+    return "\n".join(fresh)
+
+
 def not_yet(text: str) -> bool:
     """A message about a bookset that is not an instruction yet ("Ready for bookset", "wait for bookset")."""
     line = normalise(text)
+    if re.search(r"\bif (?:you )?enter", line):  # SK Astro "If Enter Bookset": whoever entered, book it now
+        return False
     return bool(re.search(CLOSE_WORDS, line) and NOT_YET.search(line))
 
 

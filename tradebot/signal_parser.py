@@ -1,12 +1,16 @@
 """Turns a Telegram message (text and/or image) into structured bet signals using OpenAI."""
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
 import json
 import logging
+import re
 import ssl
 from datetime import datetime, timedelta
 
+import openai
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import ValidationError
 
@@ -23,6 +27,7 @@ TEAM_SHORT_FORMS = {
     "ind": "India", "wi": "West Indies", "aus": "Australia", "eng": "England", "pak": "Pakistan",
     "sa": "South Africa", "nz": "New Zealand", "sl": "Sri Lanka", "ban": "Bangladesh", "afg": "Afghanistan",
     "zim": "Zimbabwe", "ire": "Ireland", "ned": "Netherlands", "sco": "Scotland", "nam": "Namibia",
+    "uae": "United Arab Emirates",
 }
 
 
@@ -45,10 +50,18 @@ How tips are written (real examples from the channel, Tamil words in English let
 "Beaz 4 odds la entry ponga 1 unit" ("entry ponga" = take the entry), "Back 5 dds darderi just 0.5 unit" \
 ("dds" = odds, the number can come before the name), "<team> back <odds>". "<team> lay <odds>" = lay entry. \
 "only", "don't go high" = don't stake more than stated; not an instruction on their own. The odds may be missing.
+- "Khao" (eat, "khaoooo", "khalo") with a team or player named = LAY that team, it is the favourite, never a back: \
+"98P - NEWZEALAND Khaooo" = lay New Zealand at 1.98. When the other side is named too ("60P TORONTO KHAO, MONTREAL \
+PLUS KRO", "50P Coco Gauff khao, Elena win karo") it is one trade: one signal, the lay of the one to eat. \
+"<X> plus karo" alone = back X.
 - Player names are often misspelt: write the correct current player's name as shown in the screenshot or as \
 you know it (Beaz -> Sebastian Baez, vechrot -> Valentin Vacherot, ruplev -> Andrey Rublev). If unsure of the \
 first name, write the surname alone. Nicknames ("Karupan", "🐐", "GOAT") mean the player of the entry the \
 message replies to, or else the latest entry.
+- Tips often name a player by FIRST name only ("Quentin Win", "Dayana win karo", "Zizou", "Hubert"): the site \
+lists players by surname, so write the full name of the player meant, taken from the screenshot, the earlier \
+messages or the current players you know (Quentin -> Quentin Halys, Dayana -> Dayana Yastremska, Zizou -> \
+Zizou Bergs, Hubert -> Hubert Hurkacz). Only when you can't tell who is meant, keep the first name as written.
 - Stake size in units: "1 unit", "2 units", "2u", "half unit" (0.5), "1/2 unit" (0.5) -> units. \
 "limit" is also used for units when it comes with a back/lay entry: "1 limit back svrcina 2.12", \
 "Back svrcina 2.12 odds 1 limit", "half limit" -> units 1, 1, 0.5. \
@@ -116,7 +129,7 @@ with confidence below 0.5. Never invent a bet.
 
 GROQ_URL = "https://api.groq.com/openai/v1"
 # Values used when Groq's JSON leaves a field out. A missing confidence counts as unreadable (skipped).
-GROQ_DEFAULTS = {"sport": "other", "event": "? v ?", "market": "other", "market_name": "", "side": "back",
+GROQ_DEFAULTS = {"sport": "other", "event": "? v ?", "market": "other", "market_name": "", "selection": "", "side": "back",
                  "odds": None, "line": None, "units": None, "amount": None, "when_odds": None, "green_pct": None,
                  "loss_cut": False, "confidence": 0.0}
 
@@ -129,17 +142,73 @@ def ai_client(api_key: str, base_url: str | None = None) -> AsyncOpenAI:
                        http_client=DefaultAsyncHttpxClient(verify=ssl.create_default_context()))
 
 
+# Text-only models tried in turn when the main one's free limit (per minute or day) is used up: each has its own
+GROQ_FALLBACK_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-20b")
+# Groq counts the reply budget into its free 8000 tokens a minute: instructions + hint + context (~3.6-4.4k) + a
+# screenshot (~1.8k) + this stays under it. Replies are 25-700 tokens (with the model's reasoning).
+GROQ_MAX_REPLY = 1000
+GROQ_MINUTE_WAIT = 20  # s: a per-minute limit that frees up within this is waited for (the tip is still fresh)
+# The reply format for Groq, short (the full JSON schema with its descriptions is ~1,100 tokens every call).
+GROQ_FORMAT = """
+Reply with one JSON object only: {"summary": "<one short line for the log>", "signals": [<signal>, ...]}
+signals = the instructions the NEW message gives (empty for results, ads, chat). Each signal has every key:
+action: entry | add (more on an earlier position) | exit (take profit at a target price) | close (book set /
+  loss cut / cashout NOW) | stake (the message only gives the stake of the entry just posted)
+sport: cricket | tennis | other;  event: "<A> v <B>"
+market: match_odds (who wins: the default for back/lay tips) | bookmaker | fancy (session / over runs lines) | other
+market_name: as written in the message, else "";  selection: team or player (fancy: the session, "6 Over Runs IND")
+side: back | lay | yes | no (yes/no only for fancy; for close, the side of the original position)
+odds: the price quoted (fancy: the rate, e.g. 100), else null (always null for close)
+line: the run line of a fancy tip ("48 yes" -> 48), else null
+units: the stake in units, only when unit / u / limit is said ("Limit 2" -> 2, "half unit" -> 0.5), else null
+amount: the stake in rupees when money is given ("Rs 500" -> 500, "1k" -> 1000), else null
+when_odds: enter only once the price gets there ("3 odds pona edunga" -> 3), else null
+green_pct: a re-entry staked with a share of the profit just booked ("green money 20%" -> 20), else null
+loss_cut: true only for a close that is a loss cut;  confidence: 0-1, how sure you READ it right
+"""
+# Added to the instructions for a voice note a channel acts on (profile act_on_voice).
+VOICE_HINT = """
+The NEW message is a voice note typed out by speech-to-text: Tamil script mixed with English words, badly spelt \
+(புக்செட் / புக்க்செட் / புக் செட் / book set / box set = bookset; லாஸ்கட் / லாஸ்ட் கட் / loss cut = loss cut; \
+பேக் / பாக்க் = back; லிமிட் = limit; ஆட்ஸ் / ads = odds; பேவர் = favourite). Most voice notes are only talk: give no \
+signal unless the listeners are told to act NOW on the match being played:
+- close: "இப்போ bookset பண்ணிடுங்க", "loss cut பண்ணிக்கோங்க", "profit இருந்தா bookset பண்ணிக்கோங்க" (book it now if in \
+profit). Naming no team is fine: leave selection empty.
+- entry: "இப்போ ஒரு limit back பண்ணிக்கோங்க" with the team named (write it in English) or clear from the context.
+- stake: only the limit of the entry just posted ("0.5 limit மட்டும்").
+No signal for: a bookset still to come ("bookset ரெடியா இருங்க", "bookset வரும்", "நானே சொல்றேன்" = I will tell you); a \
+price still to come ("1.8 range வந்தா bookset பண்ணலாம்"); what already happened or another match ("1.7ல bookset பண்ணோம்", \
+"லாஸ்கட் பண்ணியிருக்கேன்"); advice for any time ("நல்ல profit வந்தா bookset நீங்களே பண்ணிக்கோங்க", "green money மட்டும் \
+use பண்ணுங்க"); predictions, wicket zones, doubts, "wait பண்ணுங்க". Confidence 0.9 only when the command is plainly \
+said; when unsure give no signal.
+"""
+# A tip's name the site's match list doesn't have (28 Oct: 11 of 17 missed entries were tennis first names).
+# Asking for the full name first matters: asked "which side?" outright, Qwen answered null for all (28 Oct test).
+PICK_SIDE = """\
+A betting tip names a player or team the short way: a tennis player by first name ("Novak", "Carlos"), a team \
+by a code or short name ("pkr", "Ads"). The betting site lists matches as "A v B" with surnames only, some with \
+the start of the first name ("T Griekspoor v Nakashima").
+1. full_name: who the tip's name is, from the current players and teams you know (first name + surname, or the \
+team's full name), else "".
+2. Find that surname / team in the listed matches.
+Reply with one JSON object only: {"full_name": "<who it is>", "index": <number of the listed match with that \
+player/team, or null if not listed>, "side": "<that side exactly as listed, or empty>"}"""
+
+
 def make_parser(settings) -> "SignalParser":
-    return SignalParser(settings.openai_api_key, settings.openai_model, settings.openai_image_detail,
-                        settings.groq_api_key if settings.ai_provider == "groq" else "", settings.groq_model)
+    groq = settings.ai_provider == "groq"
+    openai_key = settings.openai_api_key if (not groq or settings.groq_openai_fallback) else ""
+    return SignalParser(openai_key, settings.openai_model, settings.openai_image_detail,
+                        settings.groq_api_key if groq else "", settings.groq_model)
 
 
 class SignalParser:
-    """Reads tips with Groq when a Groq key is given, else OpenAI. Images always go to OpenAI
-    (Groq has no production vision model); without an OpenAI key only the message text is read."""
+    """Reads tips with Groq (free tier) when AI_PROVIDER=groq, screenshots included (its model must take
+    images, e.g. Qwen 3.8), else with OpenAI. With Groq and an OpenAI key too (GROQ_OPENAI_FALLBACK), a message
+    is read by OpenAI only once every Groq model's free limit is used up; without one, it is not read at all."""
 
     def __init__(self, api_key: str, model: str, image_detail: str = "high", groq_key: str = "",
-                 groq_model: str = "llama-3.3-70b-versatile"):
+                 groq_model: str = "qwen/qwen3.8-27b"):
         self._client = ai_client(api_key) if api_key else None
         self._groq = ai_client(groq_key, GROQ_URL) if groq_key else None
         self._model = model
@@ -149,7 +218,10 @@ class SignalParser:
 
     @property
     def name(self) -> str:
-        return f"groq {self._groq_model}" if self._groq else f"openai {self._model}"
+        if self._groq:
+            return f"groq {self._groq_model}" + (f" (OpenAI {self._model} when its limits are used up)"
+                                                 if self._client else "")
+        return f"openai {self._model}"
 
     async def parse(self, text: str, image: bytes | None = None, context: list[str] | None = None,
                     reply_to: str = "", hint: str = "") -> ParsedMessage:
@@ -160,10 +232,8 @@ class SignalParser:
         if context:
             prompt = "Earlier messages, oldest first (context only):\n" + "\n".join(context) + "\n\n" + prompt
         instructions = INSTRUCTIONS + (f"\nAbout this channel's tipster:\n{hint.strip()}\n" if hint.strip() else "")
-        if self._groq and not (image and self._client):
-            if image:
-                log.warning("image tip read as text only: Groq has no vision model and no OPENAI_API_KEY is set")
-            parsed = await self._parse_groq(prompt, instructions)
+        if self._groq:
+            parsed = await self._parse_groq(prompt, instructions, image)
         else:
             parsed = await self._parse_openai(prompt, image, instructions)
         for sig in parsed.signals:
@@ -189,28 +259,157 @@ class SignalParser:
             self.last_usage = (response.usage.input_tokens, response.usage.output_tokens)
         return response.output_parsed or ParsedMessage(signals=[], summary="(AI returned no result)")
 
-    async def _parse_groq(self, prompt: str, instructions: str = INSTRUCTIONS) -> ParsedMessage:
-        system = (instructions + "\nReply with one JSON object only, matching this JSON schema:\n"
-                  + json.dumps(ParsedMessage.model_json_schema()))
-        for attempt in range(2):
-            response = await self._groq.chat.completions.create(
-                model=self._groq_model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
+    async def _parse_groq(self, prompt: str, instructions: str = INSTRUCTIONS,
+                          image: bytes | None = None) -> ParsedMessage:
+        system = instructions + GROQ_FORMAT
+        content: str | list[dict] = prompt
+        picture = image
+        if image:
+            try:
+                picture = _shrink(image)
+            except Exception:  # not a picture Pillow knows: sent as it is
+                log.warning("could not scale the screenshot down", exc_info=True)
+            content = [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": _data_url(picture)}}]
+        models = [self._groq_model, *(m for m in GROQ_FALLBACK_MODELS if m != self._groq_model)]
+        model = models.pop(0)
+        waited: set[str] = set()
+        for attempt in range(4 + 2 * len(GROQ_FALLBACK_MODELS)):
+            try:
+                response = await self._groq.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    max_tokens=GROQ_MAX_REPLY,
+                )
+            except openai.RateLimitError as exc:
+                which = re.search(r"on (tokens|requests) per (minute|day)[^.]*\. Limit \d+, Used \d+, Requested \d+",
+                                  str(exc))
+                wait = _retry_after(str(exc))
+                if which and which.group(2) == "minute" and wait is not None and wait <= GROQ_MINUTE_WAIT \
+                        and model not in waited:
+                    waited.add(model)  # a burst of messages: this minute's tokens free up in a moment
+                    log.info("Groq %s busy this minute: reading again in %.0fs", model, wait)
+                    await asyncio.sleep(wait + 0.5)
+                    continue
+                if not models:
+                    if self._client:
+                        log.warning("Groq's free limits are used up: reading with OpenAI %s", self._model)
+                        return await self._parse_openai(prompt, image, instructions)
+                    raise
+                log.warning("Groq %s limit reached (%s): reading with %s (text only)", model,
+                            which.group(0) if which else str(exc)[:160], models[0])
+                model, content = models.pop(0), prompt
+                continue
+            except openai.BadRequestError as exc:
+                if "json_validate_failed" in str(exc):
+                    # the model's reply wasn't valid JSON (27 Oct: the message went unread): again, then the next model
+                    if attempt and models:
+                        model, content = models.pop(0), prompt  # the fallback models read text only
+                    log.warning("Groq reply wasn't valid JSON: reading again with %s", model)
+                    continue
+                if not image or isinstance(content, str):
+                    raise
+                log.warning("Groq %s refused the screenshot (%s): reading the text only", model, exc)
+                content = prompt
+                continue
             if response.usage:
                 self.last_usage = (response.usage.prompt_tokens, response.usage.completion_tokens)
             try:
                 data = json.loads(response.choices[0].message.content or "{}")
                 for sig in data.get("signals") or []:
                     for key, value in GROQ_DEFAULTS.items():
-                        sig.setdefault(key, value)
+                        if sig.get(key) is None:  # left out, or null (a close naming no team: side and selection)
+                            sig[key] = value
                 data.setdefault("summary", "")
                 return ParsedMessage.model_validate(data)
             except (ValueError, ValidationError) as exc:
                 log.warning("Groq reply not in the expected format (attempt %d): %s", attempt + 1, exc)
         return ParsedMessage(signals=[], summary="(AI reply unreadable)")
+
+    async def resolve_name(self, name: str, event: str, listed: list[str]) -> str | None:
+        """The side of the site's list ('T Griekspoor') that a tip's short name ('Tallon') means, as listed, or
+        None when no model can tell. Each model knows different players (28 Oct: Qwen knew Zizou Bergs and Jacob
+        Fearnley, gpt-oss Tallon Griekspoor and Frances Tiafoe), so the next one is asked when one can't say."""
+        matches = "\n".join(f"{i}. {n[:60]}" for i, n in enumerate(listed))
+        prompt = f"The tip names: {name} (its match: {event})\nListed matches:\n{matches}"
+        async for model, reply in self._json_replies(PICK_SIDE, prompt):
+            side = _listed_side(reply, listed)
+            if side:
+                log.info("AI (%s): '%s' is %s, listed as %s", model, name, reply.get("full_name") or "?", side)
+                return side
+        return None
+
+    async def _json_replies(self, system: str, prompt: str):
+        """A small text question answered as JSON by each Groq model in turn (one at its limit is skipped, not
+        waited for), then OpenAI: yields (model, reply) until the caller has its answer."""
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        if self._groq:
+            for model in [self._groq_model, *(m for m in GROQ_FALLBACK_MODELS if m != self._groq_model)]:
+                try:
+                    response = await self._groq.chat.completions.create(
+                        model=model, messages=messages, response_format={"type": "json_object"}, temperature=0,
+                        max_tokens=GROQ_MAX_REPLY)
+                except (openai.RateLimitError, openai.BadRequestError) as exc:
+                    log.info("Groq %s could not answer (%s): asking the next model", model, str(exc)[:120])
+                    continue
+                yield model, _json_object(response.choices[0].message.content)
+        if self._client:
+            response = await self._client.chat.completions.create(
+                model=self._model, messages=messages, response_format={"type": "json_object"})
+            yield self._model, _json_object(response.choices[0].message.content)
+
+
+def _side_key(side: str) -> str:
+    """The word that tells a side apart: 'Griekspoor' of 'T Griekspoor', 'Stars' of 'Melbourne Stars W' (both sides of
+    a women's match end in W: 31 Oct, 'Melbourne Stars W' was taken for the 'Adelaide Strikers W' listed first)."""
+    words = [w for w in re.findall(r"[a-z0-9]+", side.lower()) if w not in ("w", "women", "men", "xi")]
+    return words[-1] if words else ""
+
+
+def _listed_side(reply: dict, listed: list[str]) -> str | None:
+    """The side of the listed match the AI named, spelt as listed ('Griekspoor' -> 'T Griekspoor'), or None."""
+    index, side = reply.get("index"), str(reply.get("side") or "").strip().lower()
+    if isinstance(index, str) and index.isdigit():
+        index = int(index)
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(listed) or not side:
+        return None
+    sides = [s.strip() for s in re.split(r"\s+(?:v|vs)\s+", listed[index], flags=re.IGNORECASE)]
+    fits = [s for s in sides if s.lower() == side] or [s for s in sides if _side_key(s) and _side_key(s) == _side_key(side)]
+    return fits[0] if len(fits) == 1 else None
+
+
+def _json_object(text: str | None) -> dict:
+    try:
+        data = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _retry_after(error: str) -> float | None:
+    """Seconds Groq says to wait ('Please try again in 1m2.5s' / 'in 830ms'), None if it doesn't say."""
+    m = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?", error)
+    if not m or not any(m.groups()):
+        return None
+    hours, minutes, seconds, millis = (float(g) if g else 0.0 for g in m.groups())
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000
+
+
+GROQ_IMAGE_SIDE = 768  # px: a full-size screenshot is more tokens than Groq's free tier takes in one minute
+
+
+def _shrink(image: bytes, side: int = GROQ_IMAGE_SIDE) -> bytes:
+    """The screenshot scaled down to `side` px on its longer edge, as JPEG (odds and names stay readable)."""
+    from PIL import Image  # only needed with Groq
+
+    with Image.open(io.BytesIO(image)) as picture:
+        if max(picture.size) <= side:
+            return image
+        picture.thumbnail((side, side))
+        out = io.BytesIO()
+        picture.convert("RGB").save(out, "JPEG", quality=85)
+        return out.getvalue()
 
 
 def _data_url(image: bytes) -> str:

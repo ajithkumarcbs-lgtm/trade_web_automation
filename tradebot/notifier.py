@@ -8,7 +8,20 @@ from telethon import TelegramClient
 
 log = logging.getLogger(__name__)
 
-ICONS = {"placed": "🟢", "simulated": "🧪", "unconfirmed": "❓", "skipped": "⚠️", "failed": "❌", "pending": "⏳"}
+ICONS = {"placed": "🟢", "simulated": "🧪", "unconfirmed": "❓", "skipped": "⚠️", "failed": "❌", "pending": "⏳",
+         "paper": "📐"}
+MESSAGE_LIMIT = 4000  # Telegram's is 4096
+
+
+def _parts(text: str) -> list[str]:
+    """A long message in parts, cut at line ends, so a long report doesn't lose its end."""
+    parts = []
+    while len(text) > MESSAGE_LIMIT:
+        cut = text.rfind("\n", 0, MESSAGE_LIMIT)
+        cut = cut if cut > 0 else MESSAGE_LIMIT
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return [*parts, text]
 
 
 class Notifier:
@@ -28,7 +41,8 @@ class Notifier:
             if image and image.exists():
                 await self._client.send_file(self._chat, image, caption=text[:1000], parse_mode="md")
             else:
-                await self._client.send_message(self._chat, text[:4000], parse_mode="md")
+                for part in _parts(text):
+                    await self._client.send_message(self._chat, part, parse_mode="md")
         except Exception:  # an alert must never stop trading
             log.warning("Telegram alert failed", exc_info=True)
 
@@ -73,6 +87,113 @@ def report_text(title: str, rows: list[dict], unit: float, unsettled: list) -> s
     if unsettled:
         lines.append("Record their results: " + ", ".join(f"/settle {p.id} win|lose ({p.selection})"
                                                        for p in unsettled[:6]))
+    return "\n".join(lines)
+
+
+def _summary(rows: list[dict], unit: float) -> str:
+    """'6 trades, 3 won 1 lost, 2 unknown, 6.0 limits, +2.86'."""
+    results = [r["pl"] for r in rows if r["pl"] is not None]
+    unknown = sum(bool(r["closed"]) and r["pl"] is None for r in rows)
+    still_open = sum(not r["closed"] for r in rows)
+    return ", ".join([f"{len(rows)} trade{'' if len(rows) == 1 else 's'}",
+                      f"{sum(pl > 0 for pl in results)} won {sum(pl < 0 for pl in results)} lost",
+                      *([f"{unknown} unknown"] if unknown else []), *([f"{still_open} open"] if still_open else []),
+                      f"{sum(r['stake'] for r in rows) / unit:.1f} limits", f"{sum(results) / unit:+.2f}"])
+
+
+def _best_first(rows: list[dict], field: str) -> list[tuple[str, list[dict]]]:
+    """The rows grouped by a field, the best result first."""
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r[field], []).append(r)
+    return sorted(groups.items(), key=lambda group: -sum(r["pl"] or 0 for r in group[1]))
+
+
+def results_report(title: str, channels: list[str], rows: list[dict], unit: float, unsettled: list) -> str:
+    """/report in limits: each channel, then match trades, fancy, toss and tennis league by league. rows:
+    Pipeline._results, where a fancy bet counts at the site's line when it was read, else at the tip's; channels: the
+    running ones, which are all listed."""
+    lines = [f"📈 *REPORT* {title}, 1 limit = ₹{unit:,.0f}", "", "*Channels*"]
+    for name, mine in _best_first(rows, "channel"):
+        sports = ", ".join(sorted({r["sport"] for r in mine}))
+        lines.append(f"• {name or '-'} ({sports}): {_summary(mine, unit)}")
+    busy = {r["channel"] for r in rows}
+    idle = [name for name in channels if name not in busy]
+    if idle:
+        lines.append("No trades: " + ", ".join(idle))
+    for name, mine in _best_first([r for r in rows if r["sport"] == "Fancy" and r["pl"] is not None], "channel"):
+        at_site = [r for r in mine if r["measured"]]
+        lines.append(f"📐 {name}: at the tip's line {sum(r['tip_pl'] for r in mine) / unit:+.2f}; " + (
+            f"the site's line read on {len(at_site)} bets, {sum(r['pl'] for r in at_site) / unit:+.2f}"
+            if at_site else "the site's line not read"))
+    for sport, heading in (("Cricket", "Cricket match"), ("Fancy", "Cricket fancy"), ("Toss", "Cricket toss"),
+                           ("Tennis", "Tennis")):
+        mine = [r for r in rows if r["sport"] == sport]
+        if mine:
+            lines += ["", f"*{heading}*: {_summary(mine, unit)}"]
+            lines += [f"• {league}: {_summary(games, unit)}" for league, games in _best_first(mine, "league")]
+    total = sum(r["pl"] or 0 for r in rows)
+    unknown = [r for r in rows if r["closed"] and r["pl"] is None]
+    lines += ["", f"Known result: {total:+.0f} ({total / unit:+.2f} limits)"]
+    if unknown:
+        worst = total - sum(r["risk"] for r in unknown)
+        lines.append(f"If the {len(unknown)} unknown ones lost: {worst:+.0f} ({worst / unit:+.2f} limits)")
+    if unsettled:
+        lines.append("Record their results: " + ", ".join(f"/settle {p.id} win|lose ({p.selection})"
+                                                       for p in unsettled[:6]))
+    return "\n".join(lines)
+
+
+def _fancy_bet(tip: dict) -> float:
+    """A fancy tip's result in units: at the site's line when it was read, else at the tip's."""
+    return tip["site_pl"] if tip.get("site_pl") is not None else (tip["pl"] or 0)
+
+
+def day_report(title: str, channels: list[dict], week: dict[str, float], summary: str = "") -> str:
+    """The day's trades of each channel in one message. channels: {"name", "unit", "trades": [{"selection",
+    "units", "price", "state" (won|lost|booked|open|ended), "pl" (units or None)}], "missed": [str],
+    "deleted": int, "deleted_traded": int}; week: channel -> units this week; summary: goes first, as a long
+    message is cut at its end."""
+    lines = [f"📊 *DAILY REPORT* {title}"]
+    if summary:
+        lines.append(f"\n{summary}")
+    if not channels:
+        lines.append("No tips today.")
+    for c in channels:
+        trades = c["trades"]
+        fancy = c.get("fancy", [])
+        total = sum(t["pl"] for t in trades if t["pl"] is not None) + sum(_fancy_bet(f) for f in fancy)
+        won = sum(t["pl"] is not None and t["pl"] > 0 for t in trades)
+        lost = sum(t["pl"] is not None and t["pl"] <= 0 for t in trades)
+        still = sum(t["pl"] is None for t in trades)
+        lines.append(f"\n*{c['name']}*: {total:+.2f}u (₹{total * c['unit']:+,.0f})")
+        if trades or not fancy:
+            lines.append(f"  ✅ {won} up · ❌ {lost} down · ⏳ {still} open/unknown")
+        if fancy:
+            f_won = sum(f["outcome"] == "won" for f in fancy)
+            f_lost = sum(f["outcome"] == "lost" for f in fancy)
+            f_open = sum(f["outcome"] is None for f in fancy)
+            f_pl = sum(_fancy_bet(f) for f in fancy)
+            lines.append(f"  📐 fancy (paper): ✅ {f_won} · ❌ {f_lost} · ⏳ {f_open} open"
+                         + (f" · ❔ {len(fancy) - f_won - f_lost - f_open} no result" if
+                            len(fancy) - f_won - f_lost - f_open else "") + f" → {f_pl:+.2f}u")
+            for f in fancy[:8]:
+                icon = {"won": "✅", "lost": "❌", None: "⏳"}.get(f["outcome"], "❔")
+                lines.append(f"    {icon} {f['text']}" + (f" → {f['note']}" if f["note"] else "")
+                             + (f" (at the site's line {f['site_pl']:+g}u)" if f.get("site_pl") is not None else ""))
+        for t in trades:
+            icon = {"open": "⏳", "ended": "❔"}.get(t["state"], "✅" if (t["pl"] or 0) > 0 else "❌")
+            result = f"{t['pl']:+.2f}u" if t["pl"] is not None else t["state"]
+            how = {"booked": "booked", "won": "won at the end", "lost": "lost at the end"}.get(t["state"], "")
+            lines.append(f"  {icon} {t['selection']} {t['units']:g}u @ {_odds(t['price'])} → {result}"
+                         + (f" ({how})" if how else ""))
+        for miss in c["missed"][:5]:
+            lines.append(f"  ⚠️ not followed: {miss}")
+        if c["deleted"]:
+            lines.append(f"  🗑 the channel deleted {c['deleted']} message(s)"
+                         + (f", {c['deleted_traded']} of them tips the bot traded" if c["deleted_traded"] else ""))
+    if week:
+        lines.append("\nThis week: " + " · ".join(f"{name} {units:+.2f}u" for name, units in week.items()))
     return "\n".join(lines)
 
 

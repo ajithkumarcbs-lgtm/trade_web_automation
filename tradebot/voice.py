@@ -1,15 +1,17 @@
-"""Voice notes -> text with OpenAI speech-to-text, so tips given by voice are read like typed ones."""
+"""Voice notes -> text with OpenAI speech-to-text (or Groq's free Whisper), so tips given by voice are read like
+typed ones."""
 from __future__ import annotations
 
 import logging
 
 import openai
 
-from .signal_parser import ai_client
+from .signal_parser import GROQ_URL, ai_client
 
 log = logging.getLogger(__name__)
 
 FALLBACK_MODEL = "whisper-1"
+GROQ_MODEL = "whisper-large-v3-turbo"  # Groq's free speech-to-text
 # Words the tipsters use, so the transcription spells them the way the channels do.
 PROMPT = ("Tamil and English mixed talk (Thanglish) by a cricket and tennis betting tipster: back, lay, odds, "
           "limit, unit, bookset, book set, losscut, loss cut, exit, jackpot, session, lambi, over, wicket, "
@@ -19,9 +21,10 @@ MAX_BYTES = 25 * 1024 * 1024  # OpenAI's limit for one file
 
 
 class Transcriber:
-    def __init__(self, api_key: str, model: str = "gpt-4o-transcribe"):
-        self._ai = ai_client(api_key)
-        self._model = model
+    def __init__(self, api_key: str, model: str = "gpt-4o-transcribe", groq: bool = False):
+        """groq: api_key is a Groq key, and its Whisper is used (model ignored)."""
+        self._ai = ai_client(api_key, GROQ_URL if groq else None)
+        self._model = GROQ_MODEL if groq else model
 
     async def __call__(self, data: bytes, filename: str) -> str:
         """Text of the recording; raises openai.APIError when OpenAI can't be reached or refuses."""

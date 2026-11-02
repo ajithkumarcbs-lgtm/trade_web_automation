@@ -1,0 +1,16 @@
+# systemd unit for Linux servers (filled in and installed by scripts/oracle_setup.sh)
+[Unit]
+Description=Telegram tips -> iob7 trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/.venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

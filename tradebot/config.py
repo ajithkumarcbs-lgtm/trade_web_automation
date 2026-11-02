@@ -84,12 +84,16 @@ class Settings:
     # Added with channels.json; defaults keep older .env files working.
     max_back_odds: float = 0  # a back above these odds is placed as a lay of the opponent (same result); 0 = off
     conditional_entry_min: int = 90  # "3 odds pona edunga": wait this long for the price, then report it missed
+    both_sides_in_match: bool = False  # paper only: a channel may hold both teams of a match (a system backing both)
     daily_stop_units: float = 0  # no new entries once today's result reaches -N units; 0 = off
     weekly_stop_units: float = 0
     monthly_stop_units: float = 0
     confirm_timeout_s: int = 90  # a tip waiting for your /yes is dropped after this long
     transcribe_model: str = "gpt-4o-transcribe"  # voice notes -> text (OpenAI)
+    voice_provider: str = ""  # who types out voice notes: openai | groq; "" = the same as AI_PROVIDER
     confirm_in_dry_run: bool = False  # paper trading asks /yes too (else it goes ahead, noting live would ask)
+    daily_report_at: str = "23:30"  # HH:MM: the day's trades of each channel to your Telegram; "" = off
+    groq_openai_fallback: bool = False  # with AI_PROVIDER=groq: OpenAI reads a message once Groq's free limits are out
 
     def require(self, *names: str) -> None:
         """Exit with a clear message if any of the named settings is empty."""
@@ -109,7 +113,7 @@ def load_settings() -> Settings:
         openai_image_detail=_str("OPENAI_IMAGE_DETAIL", "high"),
         ai_provider=_str("AI_PROVIDER", "openai").lower(),
         groq_api_key=_str("GROQ_API_KEY"),
-        groq_model=_str("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        groq_model=_str("GROQ_MODEL", "qwen/qwen3.8-27b"),
         alerts=_bool("ALERTS", True),
         alert_chat=_chat(_str("ALERT_CHAT", "me")),
         auto_bookset_units=_float("AUTO_BOOKSET_UNITS", 0),
@@ -146,7 +150,10 @@ def load_settings() -> Settings:
         monthly_stop_units=_float("MONTHLY_STOP_UNITS", 0),
         confirm_timeout_s=_int("CONFIRM_SECONDS", 90),
         transcribe_model=_str("TRANSCRIBE_MODEL", "gpt-4o-transcribe"),
+        voice_provider=_str("VOICE_PROVIDER", "").lower(),
         confirm_in_dry_run=_bool("CONFIRM_IN_DRY_RUN", False),
+        daily_report_at=_str("DAILY_REPORT_AT", "23:30"),
+        groq_openai_fallback=_bool("GROQ_OPENAI_FALLBACK", False),
     )
     DATA_DIR.mkdir(exist_ok=True)
     return settings

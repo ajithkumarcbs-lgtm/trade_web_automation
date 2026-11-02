@@ -13,6 +13,8 @@ from .store import Position, Store, period_start
 SUPPORTED_MARKETS = ("match_odds",)
 CONDITIONAL_TOLERANCE = 0.02  # "3 odds pona edunga": goes in once the back price is within 2% of 3
 STOP_PERIODS = (("day", "daily_stop_units"), ("week", "weekly_stop_units"), ("month", "monthly_stop_units"))
+OTHER_RUNNER_APART = 1.5  # a tip this many times away from the runner's price isn't that price moving ...
+OTHER_RUNNER_FIT = 0.12  # ... and the other runner's if 1/tip + 1/price is this close to 1
 
 
 @dataclass
@@ -30,6 +32,13 @@ def to_decimal(market: str, price: float) -> float:
     if market == "bookmaker" and price >= 10:
         return 1 + price / 100
     return price
+
+
+def other_runners_price(tip: float, live: float) -> bool:
+    """The tip's price can't be this runner's and fits the other one's: the two prices of a match add up (1/1.30 +
+    1/4.4 = 1). '30p hai khao' with H Dart at 4.4 is about the favourite at 1.30, whoever the AI took it for."""
+    return (max(tip, live) >= OTHER_RUNNER_APART * min(tip, live)
+            and abs(1 / tip + 1 / live - 1) <= OTHER_RUNNER_FIT)
 
 
 def liability(side: str, stake: float, price: float | None) -> float:
@@ -94,10 +103,12 @@ class RiskManager:
         return self._channels.settings_for(name) if self._channels is not None and name else self._s
 
     def _find(self, sig: BetSignal, channel: str = "") -> Position | None:
-        """The recorded trade the instruction is about: by the AI's name, else by the rules' spelling."""
-        position = self._store.find_position(sig.selection, self._mode, channel)
+        """The recorded trade the instruction is about: by the AI's name, else by the rules' spelling. On paper only
+        the channel's own trades (commands you type in Saved Messages reach every channel's)."""
+        strict = self._mode != "live" and channel not in ("", "manual")  # channels.MANUAL
+        position = self._store.find_position(sig.selection, self._mode, channel, strict)
         if position is None and sig.aka:
-            position = self._store.find_position(sig.aka, self._mode, channel)
+            position = self._store.find_position(sig.aka, self._mode, channel, strict)
         return position
 
     def precheck(self, sig: BetSignal, retrying: bool = False) -> Decision:
@@ -127,12 +138,16 @@ class RiskManager:
         max_stake = s.max_units_per_bet * s.unit_stake
         if max_stake and stake > max_stake:
             return Decision(False, f"stake {stake:g} is above MAX_UNITS_PER_BET x UNIT_STAKE = {max_stake:g}")
-        position = self._find(sig)
+        # Live, the site holds one position per match whichever channel tipped it; on paper each channel's trades are
+        # its own, so a channel's result doesn't depend on what another channel tipped first.
+        own = sig.channel if self._mode != "live" else ""
+        position = self._find(sig, own)
         if position and position.exit_price is None:
             return Decision(False, f"already in a trade on {position.selection} since {position.opened_at[11:16]}")
         # The site's Cashout books the whole match: one trade's bookset would close the other too. Needs the site's
         # match names, so not in signals-only mode, where trades carry the AI's guess of the match.
-        other = self._store.trade_in_match(sig.selection, self._mode) if self._mode != "signals_only" else None
+        both_sides = s.both_sides_in_match and self._mode != "live"
+        other = None if both_sides or self._mode == "signals_only" else self._store.trade_in_match(sig.selection, self._mode, own)
         if other:
             minutes = (trade_log.clock() - datetime.fromisoformat(other.opened_at)).total_seconds() / 60
             fix = (f". It came {minutes:.0f} min after that entry: if the tipster corrected the team, book "
@@ -140,7 +155,7 @@ class RiskManager:
             return Decision(False, f"SAME MATCH: the bot already holds {other.selection} in {other.event} "
                                    f"({other.channel or 'TELEGRAM_CHAT'}); the site books a match as one position, "
                                    f"so a second trade there would be closed by the first one's bookset{fix}")
-        if not retrying and self._store.find_pending(sig.selection, self._mode, "entry"):
+        if not retrying and self._store.find_pending(sig.selection, self._mode, "entry", own):
             return Decision(False, f"an entry on {sig.selection} is already being retried")
         count, _ = self._store.today_totals(self._mode)
         if self._s.max_bets_per_day and count >= self._s.max_bets_per_day:
@@ -235,7 +250,8 @@ class RiskManager:
                     return Decision(False, waiting)
             elif sig.odds and live_price is not None:
                 problem = self.slippage(sig, dec)
-                if problem and s.ignore_slippage and self._mode != "live":
+                wrong_runner = sig.side == "lay" and other_runners_price(to_decimal(sig.market, sig.odds), dec)
+                if problem and s.ignore_slippage and self._mode != "live" and not wrong_runner:
                     note = f"IGNORE_SLIPPAGE (test only, never live): {problem}"
                 elif problem:
                     return Decision(False, problem)

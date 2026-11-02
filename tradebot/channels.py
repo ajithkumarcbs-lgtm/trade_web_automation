@@ -24,7 +24,7 @@ MANUAL = "manual"  # strict commands you type in your Telegram Saved Messages
 # .env settings a channel may set differently for its own trades
 OVERRIDABLE = {"unit_stake", "max_units_per_bet", "min_odds", "max_odds", "odds_tolerance", "odds_tolerance_abs",
                "min_confidence", "auto_bookset_units", "max_liability_per_bet", "bookset_green_wait_s",
-               "book_only_green", "signal_max_age_s", "conditional_entry_min"}
+               "book_only_green", "signal_max_age_s", "conditional_entry_min", "both_sides_in_match"}
 
 
 @dataclass(frozen=True)
@@ -32,19 +32,34 @@ class Profile:
     """How the tips of a channel are read and traded."""
     name: str
     trade: bool = True  # False: only watched (e.g. for new group links), never traded
-    rules: str = ""  # rule set that double-checks the AI on this tipster's usual formats: tipster | ss | tennistv | ""
+    rules: str = ""  # rule set that double-checks the AI on the usual formats: tipster | ss | tennistv | david | mine |
+    # sk | panther_toss | ""
+    rules_only: bool = False  # only what the rule set reads; no AI (a channel of one format, which the AI can only misread)
+    rules_first: bool = False  # what the rule set reads goes without the AI, whose free limit can run out; the rest goes to it
     strict_only: bool = False  # only the strict command format (BACK Shelton 3.25 1u ...); no AI
     voice: bool = False  # voice notes / video notes are transcribed: context for the next messages
     act_on_voice: bool = False  # with voice: a voice note can also be an instruction by itself (needs good transcripts)
     entry_words: str = ""  # regex: an entry only the AI read, from a text without a screenshot, needs one of these
     act_on_forwards: bool = True  # False: forwarded messages (members' "book set maar diya" testimonials) are context
+    ai_filter: bool = False  # True: a text without a picture and without any instruction word skips the AI (saves
+    # a free tier's daily tokens: "Good morning", zone lists, promos); it stays in the context
+    fancy_paper: bool = False  # True: fancy (session) tips are kept on paper and settled from Cricbuzz's scores
+    bare_photos: bool = True  # with ai_filter, False: a photo without a caption (result / promo albums) skips the AI
     hint: str = ""  # extra instructions for the AI about this tipster's style
     aliases: dict[str, str] = field(default_factory=dict)  # tipster's short names -> the site's names
     settings: dict = field(default_factory=dict)  # .env settings that differ for this channel's trades
     small_units: float = 0.5  # stake for "try small amount" tips without a stake; 0 = skip them
+    rupees_per_unit: float = 0  # the tipster's own rupees for 1 unit: "Rs500" = 500/this of your units; 0 = your rupees
     green_money: str = "skip"  # "green 20% back 7 odds": skip, or stake that % of the profit just booked
     stake_wait_s: int = 0  # an entry without a stake waits this long for its "Limit 2" / "Green 20%" message
     limit_followup_s: int = 0  # "Limit 2" this many seconds after an entry tops it up to 2 units; 0 = ignore
+    enter_before_start_min: int = 0  # a tip before its match is entered this many minutes before the start; 0 = at once
+    ladder: bool = False  # a tip that a team wins is traded by laying the other team in steps (tradebot/ladder.py)
+    ladder_rules: dict = field(default_factory=dict)  # tradebot/ladder.py LadderRules that differ for this channel
+    jackpot_source: bool = False  # the channel's 'Nov 5 Jackpot Alert' posts set the jackpot days
+    jackpot_days_only: bool = False  # live: entries only on jackpot days; paper: every day, the days reported apart
+    pasted: bool = False  # tips pasted by hand from WhatsApp: stamped lines that aren't new are history, never traded
+    paper_only: bool = False  # a live run ignores this channel: DRY_RUN=false must not put every test channel on real money
     confirm: dict = field(default_factory=dict)  # ask you first: always, below_confidence, above_units, disagree
     watch_links: bool = False  # alert you when the channel posts a Telegram group link
 
@@ -167,8 +182,9 @@ def _profile(name: str, values: dict) -> Profile:
         raise SystemExit(f"channels.json: profile '{name}' can't override {', '.join(sorted(bad))} "
                          f"(allowed: {', '.join(sorted(OVERRIDABLE))})")
     rules = values.get("rules", "")
-    if rules not in ("", "tipster", "ss", "tennistv"):
-        raise SystemExit(f"channels.json: profile '{name}' has unknown rules '{rules}' (tipster, ss, tennistv or empty)")
+    if rules not in ("", "tipster", "ss", "tennistv", "david", "mine", "sk", "panther_toss"):
+        raise SystemExit(f"channels.json: profile '{name}' has unknown rules '{rules}' "
+                         f"(tipster, ss, tennistv, david, mine or empty)")
     try:
         re.compile(values.get("entry_words", ""))
     except re.error as exc:

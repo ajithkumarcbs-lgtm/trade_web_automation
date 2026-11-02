@@ -206,6 +206,23 @@ log in again there (`python -m tools.telegram_setup`, `python -m tools.snapshot_
 `scripts\install_task.ps1` and set the VPS user to log on automatically, so the task starts after a reboot.
 Keep only one copy of the bot running: two would place every bet twice.
 
+**On Oracle Cloud Always Free** (Ampere A1, 4 CPU / 24 GB, Ubuntu, region Mumbai or Hyderabad; upgrade the
+account to Pay As You Go, still free within the limits, so an idle Always Free instance isn't reclaimed):
+
+```bash
+# on your PC (Git Bash): copy the code, without .venv / data
+scp -r main.py tradebot tools scripts tests requirements.txt channels.example.json ubuntu@<server-ip>:~/trade_web_automation/
+# on the server
+cd ~/trade_web_automation && bash scripts/oracle_setup.sh
+# back on the PC: STOP the PC bot first, then copy the private files
+scp .env channels.json ubuntu@<server-ip>:~/trade_web_automation/
+scp data/telegram.session ubuntu@<server-ip>:~/trade_web_automation/data/
+# on the server: BROWSER_CHANNEL=chromium and HEADLESS=true in .env, then
+sudo systemctl start tradebot && journalctl -u tradebot -f
+```
+
+The site logs in again on the server (a Windows Chrome profile doesn't carry over); a new IP may get an OTP.
+
 ## Tests
 
 ```powershell

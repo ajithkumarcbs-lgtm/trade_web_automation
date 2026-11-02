@@ -3,10 +3,12 @@ the site's Cashout, and cancels waiting bets from Open Bets."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, Locator, Page, Playwright, async_playwright
@@ -15,6 +17,7 @@ from rapidfuzz import fuzz
 
 from . import site_selectors as sel
 from .config import DATA_DIR, Settings
+from .fancy import PLAYER_KINDS, Session, plain_team, site_session_row
 from .models import BetSignal
 from .names import NAME_MATCH_MIN, code_fits, contains_player, name_score
 from .risk import RiskManager, book, book_set_stake, exit_plan, exit_side, lay_instead_of_back, liability
@@ -27,6 +30,13 @@ SCREENSHOT_DIR = DATA_DIR / "screenshots"
 OUTCOME_WAIT_S = 20  # the site holds Match Odds bets for 6 s before accepting them
 SUSPEND_RETRIES = 3  # tries while a market is suspended, 1 s apart
 HEDGE_ROUND_UP = 0.8  # a booking bet of 80-100% of the site's Min Bet is placed at the Min Bet
+# A short name the AI matched to a listed side ('Tallon' = 'T Griekspoor') is kept this long; one it couldn't
+# match is asked again after RESOLVE_AGAIN (entries are retried every 10 s).
+RESOLVED_KEEP = timedelta(hours=3)
+RESOLVE_AGAIN = timedelta(minutes=3)  # each ask can be 3 models' calls: kept rare on the free tier
+RESOLVE_BACKOFF = 7  # and doubled each time it stays unanswered (up to 6 h): an order can wait for days on a match gone
+RESOLVE_LIST_MAX = 200  # matches shown to the AI
+FANCY_OPEN_TRIES = 4  # looks at a fancy row 2 s apart while it says BALL RUNNING
 
 
 @dataclass
@@ -55,6 +65,29 @@ async def launch_browser(pw: Playwright, settings: Settings, headless: bool) -> 
     )
 
 
+@dataclass
+class FancyQuote:
+    """What the site offered for a session tip when it came."""
+    name: str  # the site's row, e.g. '15 Over MLSW'
+    line: float  # for the tip's side: NO 128 / YES 129
+    rate: float
+    other_line: float  # the other side's
+    closed: bool = False  # BALL RUNNING the whole time looked at: the numbers are the last shown
+    slip: str = ""  # paper: what the bet slip did when opened on it (nothing is placed)
+
+
+@dataclass
+class TeamQuote:
+    """The other team of a match, as the site shows it now."""
+    other: str = ""
+    event: str = ""
+    lay: float | None = None
+    back: float | None = None
+    gone: bool = False  # the site doesn't list the match, or it hasn't just one other team
+    problem: str = ""  # why there are no prices
+    team_back: float | None = None  # the tipped team's own back price
+
+
 class BetAborted(Exception):
     def __init__(self, status: str, reason: str, price: float | None = None):
         super().__init__(reason)
@@ -75,10 +108,31 @@ class ExchangeBot:
         self._row: Locator | None = None  # and its row
         self._match_name = ""  # site's name of the match opened last
         self._saved_for: set[str] = set()  # instructions whose failure page was already saved
+        # (tip's name, its match, the listed matches) -> the listed side meant, by the AI (set by the caller)
+        self.resolve_name: Callable[[str, str, list[str]], Awaitable[str | None]] | None = None
+        self._resolved: dict[str, tuple[datetime, str | None, int]] = {}  # name -> when asked, the side, times unanswered
 
     @property
     def busy(self) -> bool:
         return self._lock.locked()
+
+    @contextlib.asynccontextmanager
+    async def _using_page(self):
+        """One browser action at a time. Headless, the page is left blank afterwards: the site's live odds
+        keep a server's CPU busy redrawing (paid for on a small cloud server), and every action opens the
+        site's list fresh anyway, so nothing is lost."""
+        async with self._lock:
+            try:
+                yield
+            finally:
+                if self._s.headless:
+                    await self._park()
+
+    async def _park(self) -> None:
+        try:
+            await self._page.goto("about:blank")
+        except Exception:
+            log.warning("  could not leave the site page idle", exc_info=True)
 
     async def start(self) -> None:
         self._pw = await async_playwright().start()
@@ -97,6 +151,8 @@ class ExchangeBot:
                                      f"If the site asks for an OTP, log in once by hand with "
                                      f"`python -m tools.snapshot_page`, then start the bot again.")
         log.info("Logged in to %s", self._s.site_url)
+        if self._s.headless:
+            await self._park()
 
     async def close(self) -> None:
         if self._ctx:
@@ -108,7 +164,7 @@ class ExchangeBot:
         """position is the trade an exit or close acts on (from the precheck).
         require_green: a bookset only goes through when it locks a profit (>= 0); else status 'retry'.
         A close the site can't take right now also returns 'retry', so the caller tries again later."""
-        async with self._lock:
+        async with self._using_page():
             try:
                 if sig.action == "close":
                     return await self._cash_out(sig, position, require_green)
@@ -146,7 +202,7 @@ class ExchangeBot:
     async def exit_price(self, pos: Position) -> float | None:
         """Best price on offer right now to close this trade (the lay price for a back), or None if the
         market is suspended or the match can't be found. Reads only; places nothing."""
-        async with self._lock:
+        async with self._using_page():
             try:
                 await self._open_match(pos.event, pos.selection)
                 _, price = await self._odds_box(pos.selection, exit_side(pos), need_price=False)
@@ -155,9 +211,92 @@ class ExchangeBot:
                 log.info("  price check for %s: %s", pos.selection, exc)
                 return None
 
+    async def quote(self, sig: BetSignal) -> float | None:
+        """The price on offer for this entry right now, None if the site doesn't list it yet. Reads only."""
+        async with self._using_page():
+            try:
+                name = await self._open_match(sig.event, sig.selection, sig.aka)
+                _, price = await self._odds_box(name, sig.side, need_price=False)
+                return price
+            except (BetAborted, PlaywrightTimeout) as exc:
+                log.info("  price of %s when tipped: %s", sig.selection, exc)
+                return None
+
+    async def other_team_quote(self, event: str, team: str) -> TeamQuote:
+        """The prices now of the team playing this one (SK Astro's method lays it). Reads only."""
+        async with self._using_page():
+            try:
+                name = await self._open_match(event, team)
+                _, team_back = await self._odds_box(name, "back", need_price=False)  # finds the team's row
+                other = await self._other_runner()
+                if other is None:
+                    return TeamQuote(gone=True, problem=f"{team}: this market has more than two runners")
+                _, lay = await self._odds_box(other, "lay", need_price=False)
+                _, back = await self._odds_box(other, "back", need_price=False)
+                return TeamQuote(other, self._match_name, lay, back, team_back=team_back)
+            except BetAborted as exc:
+                return TeamQuote(gone=exc.status == "failed", problem=exc.reason)
+            except PlaywrightTimeout as exc:
+                return TeamQuote(problem=str(exc).splitlines()[0])
+
+    async def fancy_quote(self, event: str, session: Session, side: str) -> FancyQuote | None:
+        """The site's line and rate for a session tip right now, None when it doesn't list that session. Reads only;
+        in a dry run it also opens the bet slip on the row and cancels it, to prove the clicks. There is no code that
+        places a fancy bet: these tips stay on paper."""
+        team = session.team
+        if session.kind in PLAYER_KINDS:  # the match's name doesn't have the player: by a team the tip's match names
+            team = next((side for side in event.split(" v ") if side.strip(" ?")), "")
+        if session.kind == "toss" or not team:
+            return None
+        async with self._using_page():
+            try:
+                await self._open_match(event, plain_team(team))
+                rows = self._page.locator(sel.FANCY_ROW)
+                await rows.first.wait_for(timeout=8000)
+                names = await rows.evaluate_all("(els, name) => els.map(e => e.querySelector(name)?.innerText || '')",
+                                                sel.FANCY_NAME)
+                index = site_session_row(names, session)
+                if index is None:
+                    log.info("  fancy: the site lists no %s %s row: %s", session.team, session.number, names[:12])
+                    return None
+                row = rows.nth(index)
+                for attempt in range(FANCY_OPEN_TRIES):
+                    closed = bool(await row.locator(sel.FANCY_CLOSED).count())
+                    if not closed or attempt == FANCY_OPEN_TRIES - 1:
+                        break
+                    await self._page.wait_for_timeout(2000)
+                cells = row.locator(sel.PRICE_CELL)  # NO | YES
+                no, yes = _numbers(await cells.nth(0).inner_text()), _numbers(await cells.nth(1).inner_text())
+                if len(no) < 2 or len(yes) < 2:  # '-': the row is shown without a price
+                    log.info("  fancy: %s has no price now", names[index])
+                    return None
+                ours, other = (yes, no) if side == "yes" else (no, yes)
+                quote = FancyQuote(names[index].strip(), ours[0], ours[1], other[0], closed)
+                if self._s.dry_run and not closed:
+                    quote.slip = await self._try_fancy_slip(cells.nth(1 if side == "yes" else 0), session)
+                return quote
+            except (BetAborted, PlaywrightTimeout) as exc:
+                log.info("  fancy: no site line for %s: %s", session.team, str(exc).splitlines()[0])
+                return None
+
+    async def _try_fancy_slip(self, cell: Locator, session: Session) -> str:
+        """Opens the bet slip on a fancy box and cancels it. Its fields are saved when it doesn't open as expected."""
+        try:
+            slip = await self._open_slip(cell)
+            low, high = await _slip_limits(slip)
+            await self._screenshot_named(f"fancy-slip-{session.team}".replace(" ", "-"))
+            await slip.locator(sel.CANCEL_BET).click()
+            return f"slip opened, limits {low}-{high}, cancelled"
+        except (BetAborted, PlaywrightTimeout) as exc:
+            path = await self._screenshot_named("fancy-slip-failed")
+            with contextlib.suppress(Exception):
+                path.with_suffix(".html").write_text(await self._page.content(), encoding="utf-8")
+            await self._close_slip()
+            return f"slip check failed: {str(exc).splitlines()[0]}"
+
     async def keep_alive(self) -> None:
         """Reloads the site so the session doesn't time out, logging in again if it did."""
-        async with self._lock:
+        async with self._using_page():
             try:
                 await self._open_list()
             except (BetAborted, PlaywrightTimeout) as exc:
@@ -263,7 +402,7 @@ class ExchangeBot:
 
     async def cancel_waiting(self, pos: Position) -> float:
         """Cancels the waiting (unmatched) bets on this trade's match; returns their total stake."""
-        async with self._lock:
+        async with self._using_page():
             await self._open_match(pos.event, pos.selection)
             return await self._cancel_unmatched()
 
@@ -459,7 +598,7 @@ class ExchangeBot:
 
     async def listed_matches(self) -> list[str] | None:
         """Names of the matches the home page lists now (None if the page couldn't be read)."""
-        async with self._lock:
+        async with self._using_page():
             try:
                 await self._open_list()
                 return await self._page.locator(sel.EVENT_ROW).locator(sel.EVENT_NAME).all_inner_texts()
@@ -570,6 +709,8 @@ class ExchangeBot:
         target = re.sub(r"\s+v\s+\?$", "", event_name)
         tried = [selection] + ([aka] if aka.strip(" ?") and aka.lower() != selection.lower() else [])
         found = {name: index for name in tried if (index := _best_index(names, target, name)) is not None}
+        if not found and self.resolve_name:
+            found = await self._found_by_ai(names, event_name, tried)
         if not found:
             named = [name for name in tried if name.strip(" ?")]
             who = f" with {' / '.join(named)}" if named else ""
@@ -587,6 +728,33 @@ class ExchangeBot:
         await page.locator(sel.RUNNER_ROW).first.wait_for(timeout=15000)
         await self._dismiss_popups()
         return name
+
+    async def _found_by_ai(self, names: list[str], event_name: str, tried: list[str]) -> dict[str, int]:
+        """A one-word name the list doesn't have (first name 'Tallon', code 'pkr'): the AI picks the listed side it
+        means ('T Griekspoor'), which must be in the list and fit any initial shown. Returns {side: match index}."""
+        for name in tried:
+            key = name.strip(" ?").lower()
+            if " " in key or len(key) < 2:  # 'bh' = Brisbane Heat
+                continue
+            when, side, tries = self._resolved.get(key, (datetime.min, None, 0))
+            fresh = datetime.now() - when < (RESOLVED_KEEP if side else RESOLVE_AGAIN * 2 ** min(tries, RESOLVE_BACKOFF))
+            if fresh and side is None:
+                continue
+            if not fresh or _best_index(names, side, side) is None:
+                try:
+                    side = await self.resolve_name(name.strip(" ?"), event_name, names[:RESOLVE_LIST_MAX])
+                except Exception as exc:  # the AI being down must not stop the retries
+                    log.warning("  could not ask the AI who '%s' is: %s", name, exc)
+                    side = None
+                if side and not _initials_fit(key, side):
+                    log.warning("  AI says '%s' is %s, but the site's initial doesn't fit: not used", name, side)
+                    side = None
+                self._resolved[key] = (datetime.now(), side, 0 if side else tries + 1)
+            index = _best_index(names, side, side) if side else None
+            if index is not None:
+                log.info("  '%s' is %s in %s (AI, from the site's list)", name, side, names[index])
+                return {side: index}
+        return {}
 
     async def _dismiss_popups(self) -> None:
         """Closes ads and notices (Escape, then their close icon) so they can't block clicks."""
@@ -630,7 +798,8 @@ class ExchangeBot:
                 continue  # not a single team row
             listed = (await name_box.inner_text()).strip()
             score = name_score(selection, listed)
-            if score < NAME_MATCH_MIN and code_fits(selection, listed):  # 'af' on the 'Amsterdam Flames' row
+            if score < NAME_MATCH_MIN and (code_fits(selection, listed)  # 'af' on the 'Amsterdam Flames' row
+                                           or _first_name_of(selection, listed)):  # 'Tallon' on 'Tallon Griekspoor'
                 score = NAME_MATCH_MIN
             if score >= NAME_MATCH_MIN and score > best:  # first row wins ties: Match Odds comes first
                 row, row_boxes, best = rows.nth(i), boxes, score
@@ -687,6 +856,11 @@ class ExchangeBot:
             liability, stake = liability * high / stake, high
         if hedge and low is not None and HEDGE_ROUND_UP * low <= stake < low:
             capped = f"hedge rounded up from {stake:g} to the site's Min Bet {low:g}"
+            log.info("  %s", capped)
+            liability, stake = liability * low / stake, low
+        if low is not None and stake < low and self._s.dry_run and self._s.ignore_slippage and stake > 0:
+            # paper test of a small unit: the tip is still followed, so its result counts
+            capped = f"paper test: stake {stake:g} raised to the site's Min Bet {low:g} (live would skip it)"
             log.info("  %s", capped)
             liability, stake = liability * low / stake, low
         if low is not None and stake < low:  # never raise an entry's stake above what was asked
@@ -826,6 +1000,20 @@ def _slug(sig: BetSignal) -> str:
     return re.sub(r"[^a-z0-9]+", "-", sig.selection.lower()).strip("-")[:40]
 
 
+def _first_name_of(name: str, listed: str) -> bool:
+    """A single name the tipster gave ('Tallon', 'Dayana') is the first name of this listed player."""
+    word = name.strip().lower()
+    parts = re.split(r"[^a-z]+", listed.lower())
+    return " " not in word and len(word) >= 3 and len(parts) >= 2 and parts[0] == word
+
+
+def _initials_fit(name: str, side: str) -> bool:
+    """The site shows some players with the start of the first name ('T Griekspoor', 'Ha Shi'): the tipster's
+    first name must begin with it ('Tallon', 'Han'). Longer first words ('Pokhara Avengers') aren't checked."""
+    words = [w for w in re.split(r"[^a-z]+", side.lower()) if w]
+    return len(words) < 2 or len(words[0]) > 3 or name.lower().startswith(words[0])
+
+
 def _best_index(names: list[str], target: str, selection: str = "") -> int | None:
     """Index of the listed match that best fits the tip (typos allowed); ties go to the closest full name,
     so 'South Africa' picks 'South Africa v Australia' over 'South Africa Legends v Australia Legends'.
@@ -835,9 +1023,11 @@ def _best_index(names: list[str], target: str, selection: str = "") -> int | Non
     scores = [(round(name_score(target, n)), fuzz.ratio(target, n.lower()), -i) for i, n in enumerate(names)
               if not must_have or contains_player(must_have, n)]
     if not scores and must_have:
-        # A team code the tipster made up ('af' = Amsterdam Flames): the one listed match with a side it fits.
-        # Two candidates ('af' = Afghanistan too) is a guess, so none.
-        fits = [i for i, n in enumerate(names) if any(code_fits(must_have, side) for side in _sides(n))]
+        # A team code the tipster made up ('af' = Amsterdam Flames), or a player's first name ('Tallon' in
+        # 'Tallon Griekspoor v Brandon Nakashima'): the one listed match with a side it fits. Two candidates
+        # ('af' = Afghanistan too) is a guess, so none.
+        fits = [i for i, n in enumerate(names)
+                if any(code_fits(must_have, side) or _first_name_of(must_have, side) for side in _sides(n))]
         return fits[0] if len(fits) == 1 else None
     if not scores:
         return None
