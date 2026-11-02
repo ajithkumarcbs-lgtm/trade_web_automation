@@ -54,6 +54,7 @@ MIN_LIMIT = 10  # /limit: the site's Min Bet, on every market seen so far
 MAX_LIMIT = 10_000  # a slip of the finger must not make 1 limit a lakh
 BOOKSET_RETRY_SECONDS = 10  # how often a refused bookset / loss cut is tried again
 TENNIS_SUSPENDED_MINUTES = 10  # a tennis entry whose market is suspended is retried this long (not ENTRY_RETRY_MINUTES)
+MARKET_SHUT_MINUTES = 30  # the site's Max Bet is 0 until it opens a market: Panther's 2 Nov tip came 23 min before the start
 HELD_ENTRY_MINUTES = 40  # an entry held for its match is tried this long from its time (10 min before to 30 after the start)
 # A waiting entry allowed longer than this can wait for days (CricStatz's Test orders): its price is read SLOW_WAIT_EVERY,
 # not every 10 s, which would keep the browser busy for all that time.
@@ -1053,6 +1054,8 @@ class Pipeline:
             return self._risk.cfg(sig).conditional_entry_min
         if sig.not_before:
             return HELD_ENTRY_MINUTES
+        if "takes no bets" in reason:
+            return max(self._s.entry_retry_min, MARKET_SHUT_MINUTES)
         if sig.sport == "tennis" and "suspended" in reason.lower():
             return max(self._s.entry_retry_min, TENNIS_SUSPENDED_MINUTES)
         return self._s.entry_retry_min

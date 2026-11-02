@@ -118,8 +118,9 @@ MY_ENTRY = re.compile(r"^\s*(?:.*\bvs?\.?\s+\S+\s+)?(?P<name>[A-Za-z][A-Za-z .]*
 # in a tick is a result: 'Sydney Match Win ✅' (the pipeline asks whether its match is still to come)
 SK_ENTRY = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z .]*?)\s+(?:(?:toss\s+or\s+)?match\s+win|even\s+or\s+(?:win|\d+\s*p)|"
                       r"win\s+or\s+(?:even|bookset))[ \t]*$", re.IGNORECASE | re.MULTILINE)
-# PANTHER TOSS: 'TOSS 👉 #SYDNEY_THUNDER_W', 'TOSS WINNER : #Sydney Sixers', 'Next 3 Match Tosses / 1. NZ / 2. IRELAND'
-TOSS_CALL = re.compile(r"\btoss(?:\s+winner)?\s*(?:👉|:)\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.IGNORECASE)
+# PANTHER TOSS: 'TOSS 👉 #SYDNEY_THUNDER_W', 'TOSS WINNER : #Sydney Sixers', 'TOSS WINNER #MELBOURNE STARS', 'Next 3 Match
+# Tosses / 1. NZ / 2. IRELAND'
+TOSS_CALL = re.compile(r"\btoss(?:\s+winner)?\s*(?:👉|:|(?=#))\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.IGNORECASE)
 TOSS_LIST_ITEM = re.compile(r"^\s*\d+\.\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.MULTILINE)
 TOSS_NAMES = {"newzealand": "new zealand", "srilanka": "sri lanka", "westindies": "west indies", "southafrica": "south africa",
               "melbourne r": "melbourne renegades", "melbourne star": "melbourne stars"}
@@ -133,6 +134,11 @@ KK_CLOSE_TOLD = re.compile(r"\bbook ?set (?:game |match )?(?:pass|done)\b|\bbook
 # side at the price now. A limit is what is risked: 1 limit on Fernandez at 2.56 and half at 5.5 is his 'sidha 2.5-2.5 limit'
 # when booked at 1.35, as Quinn's '1.5 limit loss pr, 4 limit plus' is at 25p. The name is the favourite, not his player.
 KK_ADD = re.compile(r"^\d{1,2} ?p (?:(?!option)(?P<name>[a-z]+) )?(?:option (?:hai )?)?(?P<units>half|\d(?:\.\d)?) limit\b")
+# Boss Fire 2.0: '06 OVER 42 YES PRS', '10 OVER 84  NOT PRS W', '1ST WICKET CALL PRS / 34 K UNDER JAYEGA'. The AI read '15 OVER 98
+# NOT PRS W' as team W on 2 Nov and '10 OVER 102' as line 10 on 27 Oct. A wicket call naming no side goes to the AI, which has
+# the context; '20 Over 179 Not Pass' is a result.
+BOSS_OVER = re.compile(r"^(?P<over>\d{1,2}) over (?P<line>\d{1,3}) (?P<side>yes|not|no) (?P<team>(?!pass\b|fail\b)[a-z]+(?: [a-z]+){0,2})$")
+BOSS_WICKET = re.compile(r"^(?P<wicket>\d)(?:st|nd|rd|th) wicket call (?P<team>[a-z]+(?: w)?) (?P<line>\d{1,3}) k (?P<way>under|upar) jayega\b")
 CLOSE_WORDS = r"(?P<word>bookset|book set|boookset|bookser|losscut|loss cut|cashout|book pannuga|book pannunga)"
 # "Bookset coming", "Ready for bookset", "Japan trade possible ... boookset": not yet
 # "Cashout khudse kr lena" (cash out yourself): the tipster gives no exit, so no close either
@@ -162,11 +168,26 @@ def _toss_calls(text: str) -> list[BetSignal] | None:
         teams = [m["team"] for m in TOSS_LIST_ITEM.finditer(plain)]
     if not teams:
         return None
-    share = re.search(r"(\d{1,2})\s*%", plain)
+    share = re.search(r"(\d{1,2})\s*%\s*(?:of\s+)?(?:your\s+)?limit", plain, re.IGNORECASE)  # not 'Because 85% Load with Perth'
     units = int(share[1]) / 100 if share else 0.1 if re.search(r"\bsmall\b", plain, re.IGNORECASE) else 0.05
     return [BetSignal(action="entry", sport="cricket", event=f"{_toss_team(team)} v ?", market="fancy", market_name="Toss",
                       selection=_toss_team(team), side="yes", odds=None, line=None, units=units, amount=None,
                       loss_cut=False, confidence=1.0) for team in teams]
+
+
+def _boss_call(text: str) -> list[BetSignal] | None:
+    """A session call of Boss Fire 2.0 in its usual words, kept on paper like any fancy tip."""
+    line = normalise(text)
+    if m := BOSS_OVER.match(line):
+        session, side = f"{int(m['over'])} Over Runs", "yes" if m["side"] == "yes" else "no"
+    elif m := BOSS_WICKET.match(line):
+        session, side = f"{m['wicket']} Wkt", "no" if m["way"] == "under" else "yes"
+    else:
+        return None
+    team = m["team"].upper()
+    return [BetSignal(action="entry", sport="cricket", event=f"{team} v ?", market="fancy", market_name=f"{session} {team}",
+                      selection=f"{session} {team}", side=side, odds=None, line=float(m["line"]), units=None, amount=None,
+                      loss_cut=False, confidence=1.0)]
 
 
 def _kk_player(text: str) -> str:
@@ -198,6 +219,8 @@ def parse_known(text: str, rules: str, reply_to: str = "") -> list[BetSignal] | 
         return None
     if rules == "kk":
         return _kk_calls(text, reply_to)
+    if rules == "bossfire":
+        return _boss_call(text)
     if rules == "panther_toss":
         return _toss_calls(text)
     if rules == "sk" and (calls := [m["name"].strip() for m in SK_ENTRY.finditer(text)]):

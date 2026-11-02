@@ -280,7 +280,12 @@ def test_a_powerplay_still_on_settles_nothing():
     inn = Innings("ZIM", total=(2, 0, 0.5), powerplay=(6, 2))
     match = Match(1, "x", teams, "In Progress", datetime.now(), "T20", innings={1: inn})
     assert settle(Session("runs", 6, "ZIM"), "no", 46, match) == (None, "")
-    inn.total, inn.powerplay = (51, 1, 6.0), (6, 51)
+    inn.total, inn.powerplay = (88, 3, 12.0), (6, 5)  # 2 Nov: the page still said 5 with the side past 10 overs, really 38
+    assert settle(Session("runs", 6, "ZIM"), "no", 46, match) == (None, "")
+    inn.overs[6] = (38, 3)  # the overs pages tell
+    assert settle(Session("runs", 6, "ZIM"), "no", 46, match) == (True, "38 after over 6")
+    del inn.overs[6]
+    inn.total, inn.powerplay, match.state = (51, 10, 16.0), (6, 51), "Complete"  # only its end is trusted
     assert settle(Session("runs", 6, "ZIM"), "no", 46, match) == (False, "51 after over 6 (powerplay)")
 
 

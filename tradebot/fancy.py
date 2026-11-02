@@ -171,8 +171,11 @@ def plain_team(team: str) -> str:
 
 
 def _row_is_team(listed: str, team: str) -> bool:
-    """The site's name of a side in a fancy row ('MLSW', 'NZ') is the tip's team ('Melbourne Stars W', 'NZ', 'INDIA')."""
-    return fit_score(team, [listed]) > 0 or code_fits(listed, plain_team(team))
+    """The site's name of a side in a fancy row ('MLSW', 'NZ') is the tip's team ('Melbourne Stars W', 'NZ', 'INDIA'). A tip
+    needn't say W for a women's side: 'Perth Scorchers' is 'PSW'."""
+    side = plain_team(team)
+    return (fit_score(team, [listed]) > 0 or code_fits(listed, side)
+            or (listed[-1:].upper() == "W" and code_fits(listed[:-1], side)))
 
 
 def same_batter(tip: str, name: str) -> bool:
@@ -391,8 +394,9 @@ def settle(session: Session, side: str, line: float, match: Match,
     if session.kind == "runs":
         if n and n in inn.overs:
             return _won(side, line, inn.overs[n][0]), f"{inn.overs[n][0]} after over {n}"
-        # A powerplay still being bowled shows its runs so far (1 Nov: '2 after over 6', 3 min into the match).
-        if n and inn.powerplay and inn.powerplay[0] == n and (ended or (inn.total and inn.total[2] >= n)):
+        # While the innings is on the powerplay's runs can't be trusted (1 Nov: '2 after over 6' 3 min into the match; 2 Nov:
+        # '5 after over 6' with the side past 10 overs, really 38): the overs pages tell, or its end.
+        if n and inn.powerplay and inn.powerplay[0] == n and ended:
             return _won(side, line, inn.powerplay[1]), f"{inn.powerplay[1]} after over {n} (powerplay)"
         if ended and inn.total and (n == 0 or n >= inn.total[2]):
             return _won(side, line, inn.total[0]), f"{inn.total[0]} (innings total, {inn.total[2]:g} overs)"

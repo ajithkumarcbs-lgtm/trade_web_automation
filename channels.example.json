@@ -90,7 +90,7 @@
       "paper_only": true,
       "ai_filter": true,
       "bare_photos": false,
-      "hint": "Tennis tips in Hindi. Entry: 'WINNER - <PLAYER>' names the player; 'SINGLE LIMIT SE KHAO' = 1 unit, 'DOUBLE LIMIT' = 2 units; '<n> PAISE KHAO' with no name = back the player of the last WINNER line, odds null (1.<n> is the opponent's price: he is the favourite being eaten). Close now: '<a> P KHILAAF SE / <b> P HUM / BOOK SET / CASH OUT'. Results ('HAAR GYA', 'WIN THA', 'WAIT FOR NEXT', 'UD GAYA BOOKIE'), '100% SURE MATCH', id / site / audio promos are not instructions.",
+      "hint": "Tennis tips in Hindi. Entry: 'WINNER - <PLAYER>' names the player; 'SINGLE LIMIT SE KHAO' = 1 unit, 'DOUBLE LIMIT' = 2 units; '<n> PAISE KHAO' or '<n> PAISA KHAO' with no name = back the player of the last WINNER line, odds null, amount null: paise are a price, never a stake (1.<n> is the opponent's price: he is the favourite being eaten). Close now: '<a> P KHILAAF SE / <b> P HUM / BOOK SET / CASH OUT'. Results ('HAAR GYA', 'WIN THA', 'WAIT FOR NEXT', 'UD GAYA BOOKIE'), '100% SURE MATCH', id / site / audio promos are not instructions.",
       "entry_words": "(khao|winner|entry)",
       "act_on_forwards": false,
       "settings": {"odds_tolerance": 0.10, "auto_bookset_units": 0}
@@ -107,10 +107,17 @@
     },
 
     "bossfire": {
+      "_comment": "MLR has no alias: 'MLR - W' meant Melbourne Stars on 2 Nov, and its letters fit both Melbourne sides, so the match on then decides.",
       "paper_only": true,
+      "rules": "bossfire",
+      "rules_first": true,
       "ai_filter": true,
       "bare_photos": false,
       "fancy_paper": true,
+      "aliases": {
+        "prs": "Perth Scorchers", "per": "Perth Scorchers", "mls": "Melbourne Stars", "syt": "Sydney Thunder", "sty": "Sydney Thunder",
+        "sys": "Sydney Sixers", "ads": "Adelaide Strikers", "bh": "Brisbane Heat", "hh": "Hobart Hurricanes", "hbh": "Hobart Hurricanes"
+      },
       "hint": "Cricket session (fancy) calls in Hindi; no match-odds tips. '<n> OVER <line> YES <TEAM>' = fancy, side yes, selection '<n> Over Runs <TEAM>', line <line>: the number before OVER is the over, the one after it the line ('10 OVER 102 YES NZ' = over 10, line 102). '<n> OVER <line> NOT <TEAM>' = the same with side no. The row of ✔️✔️✔️ under a YES call and of ❌❌❌ under a NOT call is decoration of the call itself, never a result: '20 OVER 164 NOT AFG MEN ❌❌❌' is a no call on 20 Over Runs AFG at 164. '<n>st/nd/th WICKET CALL' with '<line> K UNDER JAYEGA' = fancy, side no, selection '<n> Wkt <TEAM batting now, from the context>', line <line>; 'UPAR JAYEGA' = side yes. 'NORMAL LIMIT' = 1 unit, 'HALF LIMIT' = 0.5, 'DOUBLE LIMIT' = 2. Not instructions: 'SESSION PASS', 'BOOM', 'FAIL', any line with the word Pass ('10 Over 80 Yes Pass ✔️✔️', '20 Over 179 Not Pass ✔️✔️': a result), 'WORKSHEET' lists, day summaries ('14 OCTOBER SESSION ... Pass'), 'Wait kro', reaction requests, toss / match predictions, promos.",
       "entry_words": "(over|wicket|wkt|yes|not|under|upar)",
       "act_on_forwards": false

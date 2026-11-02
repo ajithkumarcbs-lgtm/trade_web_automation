@@ -53,6 +53,15 @@ def test_toss_calls_are_read_in_his_three_forms():
     assert parse_known("𝐓𝐎𝐒𝐒 👉 #MELBOURNE_R 🇦🇺🇦🇺", "panther_toss")[0].selection == "Melbourne Renegades"
 
 
+def test_a_toss_call_with_no_mark_stakes_his_small_limit_not_the_markets_load():
+    """2 Nov: Melbourne Stars W won that toss, and the rule missed the call."""
+    text = "TOSS WINNER #MELBOURNE STARS \n\nPlay On Very small limit ( 200-300) 👍\n\nBecause 85% Load with Perth Today !\n\nGoing Against Market ✍️"
+    (call,) = parse_known(text, "panther_toss")
+    assert (call.selection, call.units, call.side) == ("Melbourne Stars", 0.1, "yes")
+    assert parse_known("TOSS WINNER : #Sydney Sixers\n\nUse 10% Limit", "panther_toss")[0].units == 0.1
+    assert parse_known("TOSS WINNER : #Sydney Sixers\n\nBecause 85% Load", "panther_toss")[0].units == 0.05
+
+
 def test_his_toss_results_are_not_calls():
     for text in ("🇦🇺 SYDNEY THUNDER - W 🇦🇺 WON THE TOSS AND OPTED TO BOWL FIRST ✔️✔️", "3/3 TOSS PASS ❤️‍🔥", "Today 3/4 Toss ❤️👍🏻",
                  "Today Toss Work 🔂\n\n3/4 ❤️❤️", "Fail", "Pass ❤️✅️", "3/3 Toss is Same Limit\nEach 200-300/- Is enough"):
