@@ -750,13 +750,14 @@ class Store:
         ).fetchall()
         return [Position(*row) for row in rows]
 
-    def recently_closed(self, selection: str, mode: str) -> tuple[str, str] | None:
+    def recently_closed(self, selection: str, mode: str, channel: str = "") -> tuple[str, str] | None:
         """(selection, closed time) of a trade on this selection closed within RECENTLY_CLOSED; with no
-        selection, of the latest closed trade."""
+        selection, of the latest closed trade. Of any channel, or only that channel's when one is given."""
         since = (clock() - RECENTLY_CLOSED).isoformat(timespec="seconds")
+        only = " AND COALESCE(channel, '') = ?" if channel else ""
         rows = self._db.execute(
-            "SELECT selection, closed_at, sport FROM positions WHERE mode = ? AND closed = 1 AND closed_at >= ?"
-            " ORDER BY closed_at DESC", (mode, since),
+            f"SELECT selection, closed_at, sport FROM positions WHERE mode = ? AND closed = 1 AND closed_at >= ?{only}"
+            " ORDER BY closed_at DESC", (mode, since, *([channel] if channel else [])),
         ).fetchall()
         if not rows:
             return None

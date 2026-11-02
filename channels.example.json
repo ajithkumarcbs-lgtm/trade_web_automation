@@ -88,6 +88,7 @@
 
     "raftaar": {
       "paper_only": true,
+      "rules": "raftaar",
       "ai_filter": true,
       "bare_photos": false,
       "hint": "Tennis tips in Hindi. Entry: 'WINNER - <PLAYER>' names the player; 'SINGLE LIMIT SE KHAO' = 1 unit, 'DOUBLE LIMIT' = 2 units; '<n> PAISE KHAO' or '<n> PAISA KHAO' with no name = back the player of the last WINNER line, odds null, amount null: paise are a price, never a stake (1.<n> is the opponent's price: he is the favourite being eaten). Close now: '<a> P KHILAAF SE / <b> P HUM / BOOK SET / CASH OUT'. Results ('HAAR GYA', 'WIN THA', 'WAIT FOR NEXT', 'UD GAYA BOOKIE'), '100% SURE MATCH', id / site / audio promos are not instructions.",

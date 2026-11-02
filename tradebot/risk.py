@@ -225,7 +225,9 @@ class RiskManager:
                                    f"{position.close_pending_since[11:16]})")
         named = bool(sig.selection.strip(" ?"))
         if position is None or not named:
-            closed = self._store.recently_closed(sig.selection, self._mode)
+            # On paper only the channel's own: another channel's booking is no repeat of this one (channels.MANUAL reaches all).
+            own = sig.channel if self._mode != "live" and sig.channel not in ("", "manual") else ""
+            closed = self._store.recently_closed(sig.selection, self._mode, own)
             # "Boookset guys 🥳" repeated after the trade was booked: nothing more to do. Without a name it is a
             # repeat when the last thing that happened was a booking, not a newer entry.
             if closed and (position is None or closed[1] > position.opened_at):

@@ -75,6 +75,19 @@ def tennis_league(draws: list[Draw], event: str) -> str | None:
     return None
 
 
+def side_of_first_name(draws: list[Draw], name: str, event: str, listed: list[str]) -> str | None:
+    """The side of the site's list a tennis tip's first name means, from who is playing: 'KATIE V' is Katie Volynets, listed
+    as 'Volynets'. None when that isn't one side ('Alex' can be two): then the AI is asked."""
+    first = name.strip(" ?").lower()
+    words = event.split(" v ")[0].lower().split()
+    initial = words[1] if len(words) == 2 and words[0] == first and len(words[1]) == 1 else ""  # the tip's start of the surname
+    players = {player for draw in draws for player in draw.players
+               if player.lower().split()[0] == first and _surname(player).startswith(initial)}
+    sides = {side.strip() for match in listed for side in re.split(r"\s+v\s+", match)
+             if len(_surname(side)) >= 3 and any(_same_player(side, player) for player in players)}
+    return sides.pop() if len(sides) == 1 else None
+
+
 def sport_of(sport: str, league: str | None) -> str:
     """Cricket or Tennis. A trade can be recorded with sport 'other' (the AI's guess): its league tells."""
     return "Tennis" if sport == "tennis" or re.match(r"(?:ATP|WTA|Tennis) ", league or "") else "Cricket"

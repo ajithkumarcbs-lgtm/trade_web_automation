@@ -134,6 +134,11 @@ KK_CLOSE_TOLD = re.compile(r"\bbook ?set (?:game |match )?(?:pass|done)\b|\bbook
 # side at the price now. A limit is what is risked: 1 limit on Fernandez at 2.56 and half at 5.5 is his 'sidha 2.5-2.5 limit'
 # when booked at 1.35, as Quinn's '1.5 limit loss pr, 4 limit plus' is at 25p. The name is the favourite, not his player.
 KK_ADD = re.compile(r"^\d{1,2} ?p (?:(?!option)(?P<name>[a-z]+) )?(?:option (?:hai )?)?(?P<units>half|\d(?:\.\d)?) limit\b")
+# Raftaar: 'WINNER - MEDVEDEV / ➥ 100% SURE MATCH...' is its tip, and '60 P KHILAAF SE / 40 P HUM / BOOK. SET / CASH. OUT' its booking.
+# The AI reads them too and spells the name ('HUMBERY HURCURZ' is Hubert Hurkacz), but read 'WINNER - ALEX M' as no bet on 29 Oct
+# and couldn't answer on that day's booking.
+RAFTAAR_ENTRY = re.compile(r"^\s*WINNER\s*-\s*(?P<name>[A-Za-z][A-Za-z .'-]{1,30}?)\s*$", re.IGNORECASE | re.MULTILINE)
+RAFTAAR_CLOSE = re.compile(r"\bbook ?set cash ?out\b")
 # Boss Fire 2.0: '06 OVER 42 YES PRS', '10 OVER 84  NOT PRS W', '1ST WICKET CALL PRS / 34 K UNDER JAYEGA'. The AI read '15 OVER 98
 # NOT PRS W' as team W on 2 Nov and '10 OVER 102' as line 10 on 27 Oct. A wicket call naming no side goes to the AI, which has
 # the context; '20 Over 179 Not Pass' is a result.
@@ -190,6 +195,14 @@ def _boss_call(text: str) -> list[BetSignal] | None:
                       loss_cut=False, confidence=1.0)]
 
 
+def _raftaar_call(text: str) -> list[BetSignal] | None:
+    if entry := RAFTAAR_ENTRY.search(text):
+        return [_signal("entry", entry["name"].strip().title()).model_copy(update={"sport": "tennis"})]
+    if RAFTAAR_CLOSE.search(normalise(text)):
+        return [_signal("close").model_copy(update={"sport": "tennis"})]
+    return None
+
+
 def _kk_player(text: str) -> str:
     """The player of a KK Expert entry post, '' when it isn't one."""
     found = KK_ENTRY.search(normalise(text))
@@ -221,6 +234,8 @@ def parse_known(text: str, rules: str, reply_to: str = "") -> list[BetSignal] | 
         return _kk_calls(text, reply_to)
     if rules == "bossfire":
         return _boss_call(text)
+    if rules == "raftaar":
+        return _raftaar_call(text)
     if rules == "panther_toss":
         return _toss_calls(text)
     if rules == "sk" and (calls := [m["name"].strip() for m in SK_ENTRY.finditer(text)]):

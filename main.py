@@ -33,7 +33,7 @@ from tradebot.fancy import (PLAYER_KINDS, Cricbuzz, Match, Session, coming_match
 from tradebot.fancy import settle as settle_session
 from tradebot.ladder import (BOOKSET, EQUAL_EXIT, FELL_BACK, GIVEBACK, STEPS, WAIT_FAVOURITE, Ladder, LadderRules, exit_call,
                              jackpot_days_in, parse_day, read_sk_tip)
-from tradebot.leagues import leagues_of, sport_of
+from tradebot.leagues import leagues_of, side_of_first_name, sport_of, tennis_draws
 from tradebot.models import BetSignal, ParsedMessage, as_bet
 from tradebot.notifier import (Notifier, bet_alert, confirm_request, day_report, match_finished, results_report,
                                trade_summary)
@@ -466,7 +466,9 @@ class Pipeline:
                     ParsedMessage(signals=rule, summary=summary)
         parsed = await self._parse_while_fresh(msg, context, profile.hint + (VOICE_HINT if msg.voice else ""))
         if parsed is None:
-            return [], "missed", None
+            if not rule:
+                return [], "missed", None
+            parsed = ParsedMessage(signals=[], summary="read by its rule: the AI could not")  # its free limit, or the network
         signals, how = reconcile(rule, parsed.signals)
         return self._screen([as_bet(s, channel.name) for s in signals], msg, channel, how), how, parsed
 
@@ -555,9 +557,10 @@ class Pipeline:
             held = self._trade_in_match_of(sig, channel)
             if held:  # 'BACKED INDIA 3.05', then 'Loss cut @1.74 NZ': the team named is where the price is
                 sig = sig.model_copy(update={"selection": held.selection, "event": held.event, "aka": ""})
-            elif channel.profile.rules_only and not channel.profile.ladder and not self._store.find_pending(
-                    sig.selection, self._mode, "entry", channel.name):
-                # its entry was never taken: the site has nothing to book, and looking would only alert 'book it by hand'
+            elif (not channel.profile.ladder and (self._mode != "live" or channel.profile.rules_only)
+                  and not self._store.find_pending(sig.selection, self._mode, "entry", channel.name)):
+                # its entry was never taken: the site has nothing to book, and looking would only alert 'book it by hand'.
+                # (Live, an AI-read booking can still be for a trade you placed by hand.)
                 reason = f"nothing to book: {channel.name} holds no trade on {sig.selection or 'any player'}"
                 await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
                 return
@@ -2121,6 +2124,19 @@ class Pipeline:
                     self._last_limit_alert, self._missed_by_limit = now, 0
                 return None
 
+    async def resolve_name(self, name: str, event: str, listed: list[str]) -> str | None:
+        """The side of the site's list a tip's short name means. A tennis player's first name comes from the day's draws on
+        ESPN, with no AI: on 2 Nov no model could say who 'KATIE V' was, with 'Volynets v A Sasnovich' listed."""
+        try:
+            side = side_of_first_name(await tennis_draws(datetime.now().date()), name, event, listed)
+        except (OSError, ValueError):
+            log.info("  ESPN could not be read to find '%s'", name)
+            side = None
+        if side:
+            log.info("  '%s' is %s on the site (ESPN's draws)", name, side)
+            return side
+        return await self._parser.resolve_name(name, event, listed)
+
     def _simulate(self, sig: BetSignal, check: Decision) -> BetResult:
         """Signals-only mode has no site, so entries are checked against the tipster's own price."""
         if sig.action == "entry":
@@ -2200,7 +2216,7 @@ async def run(signals_only: bool) -> None:
     if mode == "live":
         log.warning("LIVE MODE: real bets will be placed")
     if bot:
-        bot.resolve_name = pipeline._parser.resolve_name  # 'Tallon' -> the site's 'T Griekspoor'
+        bot.resolve_name = pipeline.resolve_name  # 'Tallon' -> the site's 'T Griekspoor'
     log.info("AI: %s | alerts to %s: %s", pipeline._parser.name, settings.alert_chat, "on" if settings.alerts else "off")
 
     def connected(client) -> None:
