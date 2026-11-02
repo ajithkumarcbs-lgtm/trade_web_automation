@@ -228,6 +228,9 @@
     {"name": "TAMIL SPORTS CENTER", "profile": "wa_tamil_sports", "ids": [-1004374707391], "title_regex": "^WA Tamil Sports", "why": "the owner's list of 1 Nov left it out: WhatsApp, pasted by hand, no live paste"},
     {"name": "DAVID REPORTS 2", "profile": "wa_david", "ids": [-1003963275193], "title_regex": "^WA David Reports", "why": "the owner's list of 1 Nov left it out: WhatsApp, pasted by hand, no live paste"}
   ],
+  "_removed_2026_11_02": [
+    {"name": "Tennis Professor", "profile": "winkaro", "ids": [-1001347348870], "why": "the owner's word of 2 Nov: 5 trades, 1 won 3 lost, 1 unknown, -0.85 limits"}
+  ],
   "channels": [
     {
       "name": "SS sports",
@@ -244,7 +247,6 @@
       "profile": "raftaar",
       "ids": [-1004333481060]
     },
-    {"name": "Tennis Professor", "profile": "winkaro", "ids": [-1001347348870]},
     {"name": "KK Expert", "profile": "kk", "ids": [-1001716508379],
      "_comment": "KK EXPERT (KAFEEL KHAN): tennis, one format, read by rules with no AI"},
     {"name": "SK Astro", "profile": "skastro", "ids": [-1002353367477]},
