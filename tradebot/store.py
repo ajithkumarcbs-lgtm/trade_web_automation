@@ -120,13 +120,19 @@ CREATE TABLE IF NOT EXISTS jackpot_days (  -- days SK Astro named: from its post
     source      TEXT,
     added_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS bot_settings (  -- what /limit, /stop and /pause set, so a restart keeps it
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  TEXT
+);
 """
 # Columns added after the first release; created on older databases at start-up.
 NEW_POSITION_COLUMNS = {"exit_stake": "REAL", "closed": "INTEGER DEFAULT 0", "closed_at": "TEXT",
                         "close_pending_since": "TEXT", "close_loss_cut": "INTEGER DEFAULT 0",
-                        "channel": "TEXT DEFAULT ''", "closed_pl": "REAL", "closed_how": "TEXT", "league": "TEXT"}
+                        "channel": "TEXT DEFAULT ''", "closed_pl": "REAL", "closed_how": "TEXT", "league": "TEXT",
+                        "unit": "REAL"}
 POSITION_COLUMNS = ("id, opened_at, sport, event, market, selection, side, price, stake, exit_price, exit_stake,"
-                    " close_pending_since, close_loss_cut, COALESCE(channel, '')")
+                    " close_pending_since, close_loss_cut, COALESCE(channel, ''), unit")
 RECENTLY_CLOSED = timedelta(hours=3)  # repeated "Bookset done 🥳" messages within this time are ignored
 LADDER_COLUMNS = ("id, created_at, channel, team, event, start_at, message_id, COALESCE(other, ''), first_price,"
                   " last_step, stopped, ended_at, COALESCE(sport, 'cricket'), COALESCE(entries, 0), COALESCE(confirmed_by, ''),"
@@ -159,6 +165,7 @@ class Position:
     close_pending_since: str | None = None  # a bookset is being retried since then
     close_loss_cut: int = 0
     channel: str = ""  # channels.json channel the tip came from
+    unit: float | None = None  # rupees of 1 limit when it was opened: /limit changes only new trades
 
     @property
     def liability(self) -> float:
@@ -223,7 +230,7 @@ class Store:
                 self._db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
         fancy_columns = {row[1] for row in self._db.execute("PRAGMA table_info(fancy)")}
         for column, kind in (("site_name", "TEXT"), ("site_line", "REAL"), ("site_rate", "REAL"), ("site_pl", "REAL"),
-                             ("league", "TEXT")):
+                             ("league", "TEXT"), ("unit", "REAL")):
             if column not in fancy_columns:
                 self._db.execute(f"ALTER TABLE fancy ADD COLUMN {column} {kind}")
         self._db.commit()
@@ -310,12 +317,13 @@ class Store:
         ).fetchone()
         return row is not None
 
-    def open_position(self, signal: BetSignal, mode: str, price: float | None, stake: float) -> None:
+    def open_position(self, signal: BetSignal, mode: str, price: float | None, stake: float,
+                      unit: float | None = None) -> None:
         self._db.execute(
-            "INSERT INTO positions (opened_at, mode, sport, event, market, selection, side, price, stake, channel)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO positions (opened_at, mode, sport, event, market, selection, side, price, stake, channel, unit)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), mode, signal.sport, signal.event, signal.market, signal.selection, signal.side, price, stake,
-             getattr(signal, "channel", "")),
+             getattr(signal, "channel", ""), unit),
         )
         self._db.commit()
 
@@ -486,12 +494,12 @@ class Store:
         """The trades opened in [since, until), for /report. A trade booked at exactly 0 is a void one (the ledger's hand
         corrections), not a result. risk: what an unknown result can lose."""
         rows = self._db.execute(
-            "SELECT COALESCE(channel, ''), sport, league, side, price, stake, closed, closed_pl, closed_how FROM positions"
+            "SELECT COALESCE(channel, ''), sport, league, side, price, stake, closed, closed_pl, closed_how, unit FROM positions"
             " WHERE mode = ? AND opened_at >= ? AND opened_at < ? ORDER BY id",
             (mode, since.isoformat(timespec="seconds"), until.isoformat(timespec="seconds"))).fetchall()
         return [{"channel": channel, "sport": sport, "league": league, "stake": stake, "closed": closed, "pl": pl,
-                 "risk": stake * (price - 1) if side == "lay" and price else stake}
-                for channel, sport, league, side, price, stake, closed, pl, how in rows
+                 "risk": stake * (price - 1) if side == "lay" and price else stake, "unit": unit}
+                for channel, sport, league, side, price, stake, closed, pl, how, unit in rows
                 if not (how == "booked" and pl == 0)]
 
     def trades_without_league(self, mode: str, since: datetime) -> list[tuple]:
@@ -506,10 +514,10 @@ class Store:
     def fancy_results(self, mode: str, since: datetime, until: datetime = datetime.max) -> list[dict]:
         """The fancy tips given in [since, until), for /report: pl at the tip's line, site_pl at the site's (units)."""
         rows = self._db.execute(
-            "SELECT COALESCE(channel, ''), kind, league, units, outcome, pl, site_pl FROM fancy WHERE mode = ? AND"
+            "SELECT COALESCE(channel, ''), kind, league, units, outcome, pl, site_pl, unit FROM fancy WHERE mode = ? AND"
             " created_at >= ? AND created_at < ? ORDER BY id",
             (mode, since.isoformat(timespec="seconds"), until.isoformat(timespec="seconds"))).fetchall()
-        keys = ("channel", "kind", "league", "units", "outcome", "pl", "site_pl")
+        keys = ("channel", "kind", "league", "units", "outcome", "pl", "site_pl", "unit")
         return [dict(zip(keys, row)) for row in rows]
 
     def fancy_without_league(self, mode: str, since: datetime) -> list[tuple]:
@@ -522,9 +530,9 @@ class Store:
         self._db.commit()
 
     def day_trades(self, mode: str, start: datetime, end: datetime) -> list[tuple]:
-        """(channel, selection, price, stake, closed, closed_pl, closed_how) of the trades opened in [start, end)."""
+        """(channel, selection, price, stake, closed, closed_pl, closed_how, unit) of the trades opened in [start, end)."""
         return self._db.execute(
-            "SELECT COALESCE(channel, ''), selection, price, stake, closed, closed_pl, closed_how FROM positions"
+            "SELECT COALESCE(channel, ''), selection, price, stake, closed, closed_pl, closed_how, unit FROM positions"
             " WHERE mode = ? AND opened_at >= ? AND opened_at < ? ORDER BY id",
             (mode, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))).fetchall()
 
@@ -553,11 +561,13 @@ class Store:
         return [row[0] for row in self._db.execute("SELECT price FROM price_log WHERE position_id = ? ORDER BY rowid DESC"
                                                    " LIMIT ?", (position_id, count)).fetchall()]
 
-    def closed_results(self, mode: str, channels: list[str]) -> list[tuple[str, float]]:
-        """(closed at, result) of these channels' finished trades with a known result, oldest first."""
+    def closed_results(self, mode: str, channels: list[str], unit: float) -> list[tuple[str, float]]:
+        """(closed at, result in limits) of these channels' finished trades with a known result, oldest first. unit: 1 limit
+        of a trade that didn't note its own."""
         marks = ",".join("?" for _ in channels)
-        return self._db.execute(f"SELECT closed_at, closed_pl FROM positions WHERE mode = ? AND channel IN ({marks}) AND closed = 1"
-                                " AND closed_pl IS NOT NULL ORDER BY closed_at", (mode, *channels)).fetchall()
+        return self._db.execute(f"SELECT closed_at, closed_pl / COALESCE(unit, ?) FROM positions WHERE mode = ?"
+                                f" AND channel IN ({marks}) AND closed = 1 AND closed_pl IS NOT NULL ORDER BY closed_at",
+                                (unit, mode, *channels)).fetchall()
 
     # --- SK Astro's method (tradebot/ladder.py) ------------------------------------------------------
 
@@ -619,12 +629,12 @@ class Store:
 
     def add_fancy(self, mode: str, channel: str, message_id: int | None, event: str, team: str, kind: str,
                   number: int, line: float, side: str, rate: float | None, units: float, site_name: str = "",
-                  site_line: float | None = None, site_rate: float | None = None) -> int:
+                  site_line: float | None = None, site_rate: float | None = None, unit: float | None = None) -> int:
         cur = self._db.execute(
             "INSERT INTO fancy (created_at, mode, channel, message_id, event, team, kind, number, line, side, rate,"
-            " units, site_name, site_line, site_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " units, site_name, site_line, site_rate, unit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), mode, channel, message_id, event, team, kind, number, line, side, rate, units, site_name,
-             site_line, site_rate))
+             site_line, site_rate, unit))
         self._db.commit()
         return cur.lastrowid
 
@@ -648,9 +658,9 @@ class Store:
         self._db.commit()
 
     def day_fancy(self, mode: str, start: datetime, end: datetime) -> list[tuple]:
-        """(channel, team, kind, number, line, side, outcome, pl, note, site_pl) of the fancy tips given in [start, end)."""
+        """(channel, team, kind, number, line, side, outcome, pl, note, site_pl, unit) of the fancy tips given in [start, end)."""
         return self._db.execute(
-            "SELECT COALESCE(channel, ''), team, kind, number, line, side, outcome, pl, note, site_pl FROM fancy"
+            "SELECT COALESCE(channel, ''), team, kind, number, line, side, outcome, pl, note, site_pl, unit FROM fancy"
             " WHERE mode = ? AND created_at >= ? AND created_at < ? ORDER BY id",
             (mode, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))).fetchall()
 
@@ -675,6 +685,16 @@ class Store:
 
     def followed(self) -> list[tuple[int, str, str]]:
         return self._db.execute("SELECT chat_id, channel, title FROM followed ORDER BY added_at").fetchall()
+
+    # --- what your commands set (/limit, /stop, /pause) ---------------------------------------------
+
+    def setting(self, key: str) -> str | None:
+        row = self._db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._db.execute("INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?,?,?)", (key, value, _now()))
+        self._db.commit()
 
     def mark_close_pending(self, position_id: int, loss_cut: bool) -> None:
         """A bookset / loss cut was asked for but the site hasn't taken it yet: keep retrying."""

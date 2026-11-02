@@ -98,9 +98,11 @@ class RiskManager:
         self._channels = channels
 
     def cfg(self, sig_or_channel: BetSignal | Position | str | None = None) -> Settings:
-        """Settings for this signal's / trade's channel."""
+        """Settings for this signal's / trade's channel. A trade keeps the limit it was opened with."""
         name = sig_or_channel if isinstance(sig_or_channel, str) else getattr(sig_or_channel, "channel", "")
-        return self._channels.settings_for(name) if self._channels is not None and name else self._s
+        if self._channels is None or not name:
+            return self._s
+        return self._channels.settings_for(name, getattr(sig_or_channel, "unit", None))
 
     def _find(self, sig: BetSignal, channel: str = "") -> Position | None:
         """The recorded trade the instruction is about: by the AI's name, else by the rules' spelling. On paper only
@@ -174,7 +176,7 @@ class RiskManager:
             if not units:
                 continue
             result = self._store.period_result(self._mode, period_start(period))
-            limit = -units * self._s.unit_stake
+            limit = -units * self.cfg("manual").unit_stake  # channels.MANUAL: 1 limit as /limit set it
             if result <= limit:
                 return (f"{period.upper()} STOP: this {period}'s result is {result:+g}, the limit is {limit:g} "
                         f"({units:g} units). No new entries until the next {period}")

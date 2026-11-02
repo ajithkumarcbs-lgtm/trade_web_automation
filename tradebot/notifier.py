@@ -90,7 +90,12 @@ def report_text(title: str, rows: list[dict], unit: float, unsettled: list) -> s
     return "\n".join(lines)
 
 
-def _summary(rows: list[dict], unit: float) -> str:
+def _in_limits(rows: list[dict], field: str = "pl") -> float:
+    """The rows' rupees in limits, each at the limit it was opened with: /limit changes only new trades."""
+    return sum((r[field] or 0) / r["unit"] for r in rows)
+
+
+def _summary(rows: list[dict]) -> str:
     """'6 trades, 3 won 1 lost, 2 unknown, 6.0 limits, +2.86'."""
     results = [r["pl"] for r in rows if r["pl"] is not None]
     unknown = sum(bool(r["closed"]) and r["pl"] is None for r in rows)
@@ -98,7 +103,7 @@ def _summary(rows: list[dict], unit: float) -> str:
     return ", ".join([f"{len(rows)} trade{'' if len(rows) == 1 else 's'}",
                       f"{sum(pl > 0 for pl in results)} won {sum(pl < 0 for pl in results)} lost",
                       *([f"{unknown} unknown"] if unknown else []), *([f"{still_open} open"] if still_open else []),
-                      f"{sum(r['stake'] for r in rows) / unit:.1f} limits", f"{sum(results) / unit:+.2f}"])
+                      f"{_in_limits(rows, 'stake'):.1f} limits", f"{_in_limits(rows):+.2f}"])
 
 
 def _best_first(rows: list[dict], field: str) -> list[tuple[str, list[dict]]]:
@@ -106,38 +111,40 @@ def _best_first(rows: list[dict], field: str) -> list[tuple[str, list[dict]]]:
     groups: dict[str, list[dict]] = {}
     for r in rows:
         groups.setdefault(r[field], []).append(r)
-    return sorted(groups.items(), key=lambda group: -sum(r["pl"] or 0 for r in group[1]))
+    return sorted(groups.items(), key=lambda group: -_in_limits(group[1]))
 
 
 def results_report(title: str, channels: list[str], rows: list[dict], unit: float, unsettled: list) -> str:
     """/report in limits: each channel, then match trades, fancy, toss and tennis league by league. rows:
     Pipeline._results, where a fancy bet counts at the site's line when it was read, else at the tip's; channels: the
-    running ones, which are all listed."""
-    lines = [f"📈 *REPORT* {title}, 1 limit = ₹{unit:,.0f}", "", "*Channels*"]
+    running ones, which are all listed; unit: 1 limit now."""
+    mixed = " now, each trade counted at its own" if any(r["unit"] != unit for r in rows) else ""
+    lines = [f"📈 *REPORT* {title}, 1 limit = ₹{unit:,.0f}{mixed}", "", "*Channels*"]
     for name, mine in _best_first(rows, "channel"):
         sports = ", ".join(sorted({r["sport"] for r in mine}))
-        lines.append(f"• {name or '-'} ({sports}): {_summary(mine, unit)}")
+        lines.append(f"• {name or '-'} ({sports}): {_summary(mine)}")
     busy = {r["channel"] for r in rows}
     idle = [name for name in channels if name not in busy]
     if idle:
         lines.append("No trades: " + ", ".join(idle))
     for name, mine in _best_first([r for r in rows if r["sport"] == "Fancy" and r["pl"] is not None], "channel"):
         at_site = [r for r in mine if r["measured"]]
-        lines.append(f"📐 {name}: at the tip's line {sum(r['tip_pl'] for r in mine) / unit:+.2f}; " + (
-            f"the site's line read on {len(at_site)} bets, {sum(r['pl'] for r in at_site) / unit:+.2f}"
+        lines.append(f"📐 {name}: at the tip's line {_in_limits(mine, 'tip_pl'):+.2f}; " + (
+            f"the site's line read on {len(at_site)} bets, {_in_limits(at_site):+.2f}"
             if at_site else "the site's line not read"))
     for sport, heading in (("Cricket", "Cricket match"), ("Fancy", "Cricket fancy"), ("Toss", "Cricket toss"),
                            ("Tennis", "Tennis")):
         mine = [r for r in rows if r["sport"] == sport]
         if mine:
-            lines += ["", f"*{heading}*: {_summary(mine, unit)}"]
-            lines += [f"• {league}: {_summary(games, unit)}" for league, games in _best_first(mine, "league")]
+            lines += ["", f"*{heading}*: {_summary(mine)}"]
+            lines += [f"• {league}: {_summary(games)}" for league, games in _best_first(mine, "league")]
     total = sum(r["pl"] or 0 for r in rows)
     unknown = [r for r in rows if r["closed"] and r["pl"] is None]
-    lines += ["", f"Known result: {total:+.0f} ({total / unit:+.2f} limits)"]
+    lines += ["", f"Known result: {total:+.0f} ({_in_limits(rows):+.2f} limits)"]
     if unknown:
         worst = total - sum(r["risk"] for r in unknown)
-        lines.append(f"If the {len(unknown)} unknown ones lost: {worst:+.0f} ({worst / unit:+.2f} limits)")
+        lines.append(f"If the {len(unknown)} unknown ones lost: {worst:+.0f} "
+                     f"({_in_limits(rows) - _in_limits(unknown, 'risk'):+.2f} limits)")
     if unsettled:
         lines.append("Record their results: " + ", ".join(f"/settle {p.id} win|lose ({p.selection})"
                                                        for p in unsettled[:6]))
@@ -150,10 +157,10 @@ def _fancy_bet(tip: dict) -> float:
 
 
 def day_report(title: str, channels: list[dict], week: dict[str, float], summary: str = "") -> str:
-    """The day's trades of each channel in one message. channels: {"name", "unit", "trades": [{"selection",
-    "units", "price", "state" (won|lost|booked|open|ended), "pl" (units or None)}], "missed": [str],
-    "deleted": int, "deleted_traded": int}; week: channel -> units this week; summary: goes first, as a long
-    message is cut at its end."""
+    """The day's trades of each channel in one message. channels: {"name", "trades": [{"selection", "unit",
+    "units", "price", "state" (won|lost|booked|open|ended), "pl" (units or None)}], "fancy": [{..., "unit"}], "missed": [str],
+    "deleted": int, "deleted_traded": int}, unit: the trade's own rupees of 1 limit; week: channel -> units this week;
+    summary: goes first, as a long message is cut at its end."""
     lines = [f"📊 *DAILY REPORT* {title}"]
     if summary:
         lines.append(f"\n{summary}")
@@ -166,7 +173,8 @@ def day_report(title: str, channels: list[dict], week: dict[str, float], summary
         won = sum(t["pl"] is not None and t["pl"] > 0 for t in trades)
         lost = sum(t["pl"] is not None and t["pl"] <= 0 for t in trades)
         still = sum(t["pl"] is None for t in trades)
-        lines.append(f"\n*{c['name']}*: {total:+.2f}u (₹{total * c['unit']:+,.0f})")
+        rupees = sum(t["pl"] * t["unit"] for t in trades if t["pl"] is not None) + sum(_fancy_bet(f) * f["unit"] for f in fancy)
+        lines.append(f"\n*{c['name']}*: {total:+.2f}u (₹{rupees:+,.0f})")
         if trades or not fancy:
             lines.append(f"  ✅ {won} up · ❌ {lost} down · ⏳ {still} open/unknown")
         if fancy:

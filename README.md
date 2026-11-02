@@ -176,7 +176,9 @@ separately per mode (signals-only, dry run, live), so testing never uses up the 
 | `/status` | Bot state, stops, open trades, today's result. |
 | `/report [day\|week\|month]` | P/L per channel: booked, settled, finished-unsettled (counted as lost), open. |
 | `/settle <trade id> win\|lose\|<amount>` | Result of a trade that ran to the end of its match. |
-| `/pause`, `/resume` | Stop / allow new entries (bookings always work). |
+| `/limit`, `/limit 100`, `/limit 1000` | What 1 limit is, or its rupees from now on. Open trades keep theirs; reports count each trade at its own. Stays after a restart. |
+| `/stop SK`, `/start SK`, `/stop` | Stop / allow one channel's new entries, or list the stopped ones. Its open trades and bookset posts go on. Stays after a restart. |
+| `/pause`, `/resume` (`/stop all`, `/start all`) | Stop / allow new entries of all channels (bookings always work). `/start SK` can't get past a pause. |
 | `/yes <n>`, `/no <n>` | Answer a CONFIRM question. |
 | `/channels`, `/follow <chat id> <channel>`, `/unfollow <chat id>` | Chats followed. |
 | `/back ...`, `/lay ...`, `/exit ...`, `/bookset ...`, `/losscut ...`, `/cancel ...` | Trade by hand (strict format). |

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable
@@ -22,6 +23,7 @@ log = logging.getLogger(__name__)
 SESSION_PATH = DATA_DIR / "telegram"  # Telethon stores the login in telegram.session
 DISCOVER_EVERY_S = 600  # how often to look for newly joined chats that match channels.json
 SPEECH_FILES = {"voice": "voice.ogg", "video_note": "video.mp4", "audio": "audio.mp3"}
+PLAIN_COMMAND = re.compile(r"^(limit(\s+\S+)?|(stop|start)\s+\S.{0,30})$", re.IGNORECASE)  # 'LIMIT 100', 'Stop SK': no slash needed
 
 
 @dataclass
@@ -188,7 +190,7 @@ async def listen(
     async def _handler(event: events.NewMessage.Event) -> None:
         if event.out and event.chat_id == me.id:  # your own Saved Messages: commands only
             text = (event.message.raw_text or "").strip()
-            if text.startswith("/") and on_command:
+            if on_command and (text.startswith("/") or (PLAIN_COMMAND.match(text) and event.message.fwd_from is None)):
                 await on_command(text)
             return
         channel = channels.for_chat(event.chat_id)

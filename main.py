@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import heapq
 import itertools
+import json
 import logging
 import re
 import time
@@ -49,6 +50,8 @@ from tradebot.voice import Transcriber
 log = logging.getLogger("tradebot")
 
 
+MIN_LIMIT = 10  # /limit: the site's Min Bet, on every market seen so far
+MAX_LIMIT = 10_000  # a slip of the finger must not make 1 limit a lakh
 BOOKSET_RETRY_SECONDS = 10  # how often a refused bookset / loss cut is tried again
 TENNIS_SUSPENDED_MINUTES = 10  # a tennis entry whose market is suspended is retried this long (not ENTRY_RETRY_MINUTES)
 HELD_ENTRY_MINUTES = 40  # an entry held for its match is tried this long from its time (10 min before to 30 after the start)
@@ -84,7 +87,9 @@ HELP = """🤖 *Commands* (send them here, in Saved Messages)
 /report [day|week|month|year]: limits per channel, cricket and tennis, league by league;
 /report 2026-10, /report 2026-10-29: the same for a past month or day
 /settle <trade id> win|lose|<amount>: result of a trade that ran to the end
-/pause, /resume: stop / allow new entries (bookings always work)
+/limit: what 1 limit is; /limit 100, /limit 1000: its rupees from now on (open trades keep theirs)
+/stop SK, /start SK: stop / allow one channel's new entries (its open trades and booksets go on); /stop: which are stopped
+/pause, /resume: stop / allow new entries of all channels (bookings always work); /stop all, /start all: the same
 /yes <n>, /no <n>: answer a CONFIRM question
 /channels: chats followed; /follow <chat id> <channel>; /unfollow <chat id>
 Trade by hand: /back Shelton 3.25 1u, /lay Sinner 1.55 0.5u, /back at Berrettini 3 1u,
@@ -325,7 +330,10 @@ class Pipeline:
         self._ladder_blocked: dict[int, str] = {}  # SK-method tip -> why its entry is blocked, told once
         self._missed_by_limit = 0  # messages not read since the last "AI limit" alert
         self._last_limit_alert = datetime.min
-        self._paused = False
+        # What your commands set stays over a restart.
+        self._paused = store.setting("paused") == "1"
+        self._stopped = {name for name in json.loads(store.setting("stopped") or "[]") if self._channels.get(name)}
+        self._channels.limit = float(store.setting("limit") or 0) or None
         self._asked: dict[int, Asked] = {}
         self._ask_number = 0
         self._held: dict[str, Held] = {}  # channel -> entry waiting for its stake message
@@ -391,6 +399,12 @@ class Pipeline:
                 log.info("msg %s [%s]: %s", msg.id, channel.name, summary)
                 return
             msg = replace(msg, text=text)
+        if channel.name in self._stopped and not any(self._trade_is_for(p, channel) for p in self._store.unclosed_positions(self._mode)):
+            # /stop, and no trade its posts could book: the AI's free limit isn't spent on it
+            self._store.log_message(msg.id, msg.text, msg.image is not None,
+                                    ParsedMessage(signals=[], summary="channel stopped, not read"), channel.name)
+            log.info("msg %s [%s]: channel stopped, not read", msg.id, channel.name)
+            return
 
         signals, how, parsed = await self._read(msg, channel, context)
         if parsed is None:
@@ -532,6 +546,9 @@ class Pipeline:
         sig, problem = self._prepare(sig, text, channel)
         if problem:
             await self._record(message_id, sig, BetResult("skipped", problem), Decision(False, problem))
+            return
+        if sig.action in ("entry", "add", "stake") and (off := self._entries_off(channel.name)):
+            await self._record(message_id, sig, BetResult("skipped", off), Decision(False, off))
             return
         if sig.action == "close" and not self._open_trade(sig, channel):
             held = self._trade_in_match_of(sig, channel)
@@ -716,7 +733,7 @@ class Pipeline:
         pos = self._store.latest_position(self._mode, channel.name, timedelta(seconds=window))
         if pos is None:
             return await skip(f"no entry of {channel.name} in the last {window}s to top up")
-        s = self._risk.cfg(channel.name)
+        s = self._risk.cfg(pos)
         target = round(sig.amount if sig.amount else sig.units * s.unit_stake, 2)  # "Try 200 or 300": rupees
         await self._raise_stake(pos, target, pos.price, sig, channel, message_id)
 
@@ -803,9 +820,9 @@ class Pipeline:
         if pos is None:
             await self._go(sig.model_copy(update={"action": "entry"}), channel, how, message_id)
             return
-        if self._paused:
-            return await skip("PAUSED: no new entries until /resume")
-        s = self._risk.cfg(channel.name)
+        if off := self._entries_off(channel.name):
+            return await skip(off)
+        s = self._risk.cfg(pos)
         if sig.confidence < s.min_confidence:  # SS 1 Nov: '3.7' alone, read as one more add at 0.40
             return await skip(f"AI confidence {sig.confidence:.2f} below {s.min_confidence}")
         odds = sig.odds or pos.price
@@ -839,7 +856,7 @@ class Pipeline:
         def skip(reason: str):
             return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
 
-        s = self._risk.cfg(channel.name)
+        s = self._risk.cfg(pos)
         if s.max_units_per_bet:  # topped up to the most you allow, as a big entry is
             target = min(target, s.max_units_per_bet * s.unit_stake)
         extra = round(target - pos.stake, 2)
@@ -879,8 +896,8 @@ class Pipeline:
                                               "pending entry cancelled, nothing to book")
                 await self._record(message_id, sig, result, Decision(False, result.reason))
                 return result
-            if sig.action == "entry" and self._paused:
-                result = BetResult("skipped", "PAUSED: no new entries until /resume")
+            if sig.action == "entry" and (off := self._entries_off(sig.channel)):
+                result = BetResult("skipped", off)
                 await self._record(message_id, sig, result, Decision(False, result.reason))
                 return result
             check = self._risk.precheck(sig)
@@ -963,6 +980,11 @@ class Pipeline:
         again, so a stale price is never taken; after ENTRY_RETRY_MINUTES (CONDITIONAL_ENTRY_MINUTES for a
         waiting entry) the tip is reported as missed."""
         for pending_id, created_at, sig, message_id, last_reason in self._store.pending_instructions(self._mode):
+            if sig.action == "entry" and sig.channel in self._stopped:
+                self._store.remove_pending(pending_id)
+                reason = self._entries_off(sig.channel)
+                await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+                continue
             if sig.not_before and datetime.now() < datetime.fromisoformat(sig.not_before):
                 continue  # held for its match: the site isn't opened until then
             if self._looked_lately(pending_id, sig):
@@ -1118,8 +1140,8 @@ class Pipeline:
         def skip(reason: str):
             return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
 
-        if self._paused:
-            return await skip("PAUSED: no new entries until /resume")
+        if off := self._entries_off(channel.name):
+            return await skip(off)
         if any(ladder.channel == channel.name and team_fits(sig.selection, [ladder.team])
                for ladder in self._store.active_ladders(self._mode)):
             return await skip(f"{sig.selection} is being watched already")
@@ -1237,7 +1259,7 @@ class Pipeline:
             await self._ladder_note(ladder, f"{ladder.other} back up at {quote.lay:g}: no more entries in this match, and "
                                             f"none if it comes down again")
         step = ladder.step_to_take(quote.lay)
-        if step is not None and not self._paused:
+        if step is not None and not self._ladder_entries_off(ladder):
             blocked = self._ladder_block(ladder)
             if not blocked:
                 await self._take_step(ladder, step, quote, trade)
@@ -1274,20 +1296,20 @@ class Pipeline:
             return f"market PAUSED, {ladder.other} at {prices[0]:g} for {rules.frozen_reads} reads: the data is stale"
         if ladder.entries:
             return ""
-        unit = self._risk.cfg(ladder.channel).unit_stake
         if sum(1 for other in self._store.active_ladders(self._mode) if other.entries) >= rules.max_open:
             return f"{rules.max_open} matches already open"
-        closed = self._store.closed_results(self._mode, [c.name for c in self._channels.all() if c.profile.ladder])
+        closed = self._store.closed_results(self._mode, [c.name for c in self._channels.all() if c.profile.ladder],
+                                            self._s.unit_stake)
         now = datetime.now()
         lost_today = sum(pl for at, pl in closed if at and at[:10] == now.date().isoformat())
-        if lost_today <= -rules.daily_loss * unit:
-            return f"the day's loss limit of {rules.daily_loss:g} limits is reached ({lost_today / unit:+.2f})"
+        if lost_today <= -rules.daily_loss:
+            return f"the day's loss limit of {rules.daily_loss:g} limits is reached ({lost_today:+.2f})"
         total = best = 0.0
         for _, pl in closed:
             total += pl
             best = max(best, total)
-        if best - total >= rules.max_drawdown * unit:
-            return f"the drawdown limit of {rules.max_drawdown:g} limits is reached ({(total - best) / unit:+.2f})"
+        if best - total >= rules.max_drawdown:
+            return f"the drawdown limit of {rules.max_drawdown:g} limits is reached ({total - best:+.2f})"
         losses = [at for at, pl in closed if pl < 0 and at]
         if losses and now - datetime.fromisoformat(losses[-1]) < timedelta(minutes=rules.cooldown_min):
             return f"cooling down for {rules.cooldown_min} min after a losing trade"
@@ -1296,7 +1318,7 @@ class Pipeline:
     async def _ladder_exit(self, ladder: Ladder, trade: Position, other_back: float, team_back: float) -> bool:
         """Books or exits when the user's rules say so (tradebot/ladder.py, exit_call). True when it did."""
         rules = self._ladder_rules(ladder.channel)
-        unit = self._risk.cfg(ladder.channel).unit_stake
+        unit = self._risk.cfg(trade).unit_stake
         target = rules.profit_target * unit
         pl = booked_profit(trade, other_back)
         peak = max(ladder.peak, pl)
@@ -1317,8 +1339,9 @@ class Pipeline:
         return True
 
     async def _take_step(self, ladder: Ladder, step: int, quote: TeamQuote, trade: Position | None) -> None:
-        """One unit more on the lay of the other team. The next look tries again if the site can't take it now."""
-        s = self._risk.cfg(ladder.channel)
+        """One unit more on the lay of the other team, at the limit of its trade once there is one. The next look tries
+        again if the site can't take it now."""
+        s = self._risk.cfg(trade or ladder.channel)
         unit = s.unit_stake
         if trade and s.max_units_per_bet and trade.stake + unit > s.max_units_per_bet * unit:
             self._store.update_ladder(ladder.id, stopped=1)  # or each look would try, and alert, again
@@ -1389,8 +1412,8 @@ class Pipeline:
     def _ladder_status(self, ladder: Ladder) -> str:
         """All of a tip at a glance, in the order the user asked for."""
         rules = self._ladder_rules(ladder.channel)
-        unit = self._risk.cfg(ladder.channel).unit_stake
         trade = self._store.find_position(ladder.other, self._mode, ladder.channel, strict=True) if ladder.other else None
+        unit = self._risk.cfg(trade or ladder.channel).unit_stake
         signal = {True: f"SIGNAL_CONFLICT, {ladder.channel} alone says {ladder.team}"}.get(ladder.conflict) or (
             f"SIGNAL_CONFIRMED, {ladder.channel} + {ladder.confirmed_by}" if ladder.confirmed_by else ladder.channel)
         lines = [f"• *{ladder.event}*: {ladder.team} (lays {ladder.other or 'the other team'}) · {ladder.state}",
@@ -1506,7 +1529,8 @@ class Pipeline:
         quote = await self._fancy_quote(sig, session, side)
         self._store.add_fancy(self._mode, channel.name, message_id, sig.event, session.team, session.kind,
                               session.number, line, side, TOSS_RATE if toss else sig.odds, units,
-                              quote.name if quote else "", quote.line if quote else None, quote.rate if quote else None)
+                              quote.name if quote else "", quote.line if quote else None, quote.rate if quote else None,
+                              unit)
         reason = (f"FANCY on paper: {_fancy_text(session.team, session.kind, session.number, line, side)}, {units:g}u; "
                   f"settled from Cricbuzz")
         if quote:
@@ -1684,18 +1708,19 @@ class Pipeline:
         return channel in (MANUAL, "", "-") or self._channels.get(channel) is not None
 
     def _results(self, since: datetime, until: datetime = datetime.max) -> list[dict]:
-        """The running channels' trades and fancy bets in [since, until), with their sport and league named. A fancy
-        bet counts at the site's line when it was read then, else at the tip's; a void one not at all."""
+        """The running channels' trades and fancy bets in [since, until), with their sport and league named, and unit, the
+        rupees of 1 limit each was opened with. A fancy bet counts at the site's line when it was read then, else at the
+        tip's; a void one not at all."""
         since = max(since, LEDGER_START)
-        unit = self._s.unit_stake
-        rows = [{**r, "sport": sport_of(r["sport"], r["league"]), "league": r["league"] or "Not named yet"}
-                for r in self._store.results(self._mode, since, until)]
+        rows = [{**r, "sport": sport_of(r["sport"], r["league"]), "league": r["league"] or "Not named yet",
+                 "unit": r["unit"] or self._s.unit_stake} for r in self._store.results(self._mode, since, until)]
         for tip in self._store.fancy_results(self._mode, since, until):
             if tip["outcome"] == "void":
                 continue
             known = tip["outcome"] in ("won", "lost")
+            unit = tip["unit"] or self._s.unit_stake
             stake = tip["units"] * unit
-            rows.append({"channel": tip["channel"], "sport": "Toss" if tip["kind"] == "toss" else "Fancy",
+            rows.append({"channel": tip["channel"], "sport": "Toss" if tip["kind"] == "toss" else "Fancy", "unit": unit,
                          "league": tip["league"] or "Not named yet", "stake": stake, "risk": stake,
                          "closed": tip["outcome"] is not None, "measured": tip["site_pl"] is not None,
                          "tip_pl": tip["pl"] * unit if known else None,
@@ -1708,7 +1733,7 @@ class Pipeline:
 
         def line(title: str, sport: str = "") -> str:
             return title + ": " + " · ".join(
-                f"{period} {sum(r['pl'] or 0 for r in rows if sport in ('', r['sport'])) / self._s.unit_stake:+.2f}"
+                f"{period} {sum((r['pl'] or 0) / r['unit'] for r in rows if sport in ('', r['sport'])):+.2f}"
                 for period, rows in periods.items())
 
         return "\n".join(["📈 *Limits* (/report week: channels and leagues)", line("🏏 Match", "Cricket"),
@@ -1730,17 +1755,17 @@ class Pipeline:
         channels: dict[str, dict] = {}
 
         def entry(name: str) -> dict:
-            unit = self._risk.cfg(name).unit_stake or self._s.unit_stake
-            return channels.setdefault(name, {"name": name or "-", "unit": unit, "trades": [], "missed": [],
+            return channels.setdefault(name, {"name": name or "-", "trades": [], "missed": [],
                                               "deleted": 0, "deleted_traded": 0, "fancy": []})
 
-        for name, selection, price, stake, closed, pl, how in self._store.day_trades(self._mode, start, end):
+        for name, selection, price, stake, closed, pl, how, unit in self._store.day_trades(self._mode, start, end):
             c = entry(name)
+            unit = unit or self._s.unit_stake
             state = "open" if not closed else ("ended" if pl is None else
                                                ("booked" if how in ("booked", None) else ("won" if pl > 0 else "lost")))
-            c["trades"].append({"selection": selection, "units": round(stake / c["unit"], 2),
+            c["trades"].append({"selection": selection, "unit": unit, "units": round(stake / unit, 2),
                                 "price": round(price, 2) if price else price,
-                                "state": state, "pl": None if pl is None else pl / c["unit"]})
+                                "state": state, "pl": None if pl is None else pl / unit})
         for name, description, reason in self._store.day_misses(self._mode, start, end):
             tag = re.match(r"\[([^\]]+)\]", description or "")
             name = name or (tag[1] if tag else "")
@@ -1751,15 +1776,12 @@ class Pipeline:
         for name, (n, traded) in self._store.day_deleted(start, end).items():
             c = entry(name)
             c["deleted"], c["deleted_traded"] = n, traded
-        for name, team, kind, number, line, side, outcome, pl, note, site_pl in self._store.day_fancy(self._mode, start, end):
+        for name, team, kind, number, line, side, outcome, pl, note, site_pl, unit in self._store.day_fancy(self._mode, start, end):
             entry(name)["fancy"].append({"text": _fancy_text(team, kind, number, line, side), "outcome": outcome, "pl": pl,
-                                         "note": note or "", "site_pl": site_pl})
-        week = {r["channel"]: round((r["booked_pl"] + r["settled_pl"]) / (self._risk.cfg(r["channel"]).unit_stake
-                                                                         or self._s.unit_stake), 2)
-                for r in self._store.report(self._mode, period_start("week")) if self._is_running(r["channel"])}
-        for name, *_, pl, _note, site_pl in self._store.day_fancy(self._mode, period_start("week"), end):
-            if self._is_running(name):
-                week[name] = round(week.get(name, 0) + (site_pl if site_pl is not None else pl or 0), 2)
+                                         "note": note or "", "site_pl": site_pl, "unit": unit or self._s.unit_stake})
+        week: dict[str, float] = {}
+        for r in self._results(period_start("week")):
+            week[r["channel"] or "-"] = round(week.get(r["channel"] or "-", 0) + (r["pl"] or 0) / r["unit"], 2)
         mode = "paper" if self._mode != "live" else "LIVE"
         title = f"{day:%a %d %b} ({mode})"
         shown = [c for c in channels.values() if self._is_running(c["name"]) and (c["name"] != MANUAL or c["trades"])]
@@ -1780,7 +1802,9 @@ class Pipeline:
         state = "⏸ PAUSED (no new entries)" if self._paused else "running"
         stop = self._risk.stop_reason()
         ladders = self._ladders_text()
+        stopped = f"⏹ Stopped: {', '.join(sorted(self._stopped))}\n" if self._stopped else ""
         return (f"✅ *Bot {state}* ({self._mode.replace('_', ' ')}), {_clock()}\n"
+                f"1 limit = ₹{self._limit_now():,.0f}\n{stopped}"
                 f"Today: {entries} entries, {booked} booked, {skipped} skipped, {failed} failed, "
                 f"result {today:+g}\n" + (f"⛔ {stop}\n" if stop else "") + f"Open trades:\n{trades}"
                 + (f"\n{ladders}" if ladders else ""))
@@ -1870,16 +1894,20 @@ class Pipeline:
         words = text.strip().split()
         name, args = words[0].lower().lstrip("/"), words[1:]
         try:
-            if name in ("help", "start"):
+            if name == "help" or (name == "start" and not args):
                 return HELP
             if name == "status":
                 return self.status_text()
+            if name == "limit":
+                return self._limit_command(args)
+            if name == "stop":
+                return self._stop_command(" ".join(args))
+            if name == "start":
+                return self._start_command(" ".join(args))
             if name == "pause":
-                self._paused = True
-                return "⏸ Paused: no new entries. Bookings, loss cuts and waiting retries still work. /resume to go on."
+                return self._set_paused(True)
             if name == "resume":
-                self._paused = False
-                return "▶️ Resumed: new entries allowed."
+                return self._set_paused(False)
             if name in ("yes", "no"):
                 return await self._answer(name == "yes", int(args[0]))
             if name == "report":
@@ -1917,6 +1945,88 @@ class Pipeline:
             replies.append(f"{result.status.upper()}: {result.reason}")
         return "\n".join(replies)
 
+    def _limit_now(self) -> float:
+        return self._channels.settings_for(MANUAL).unit_stake
+
+    def _limit_text(self) -> str:
+        unit = self._limit_now()
+        worst = sum(high - 1 for _, high in STEPS) * unit
+        return (f"A tip's 1 limit = ₹{unit:,.0f}, its 2 limits = ₹{2 * unit:,.0f}. SK method: {len(STEPS)} entries of "
+                f"₹{unit:,.0f} in a match, at most about -₹{worst:,.0f}.\nNew trades only: a trade already open keeps its own. "
+                f"({self._mode.replace('_', ' ')})")
+
+    def _limit_command(self, args: list[str]) -> str:
+        """/limit: what 1 limit is. /limit 100: that many rupees from now on, also after a restart."""
+        before = self._limit_now()
+        if not args:
+            return f"💰 *1 limit = ₹{before:,.0f}*\n{self._limit_text()}"
+        amount = "".join(args).lstrip("₹").replace(",", "")
+        if not amount.isdigit() or not MIN_LIMIT <= int(amount) <= MAX_LIMIT:
+            raise ValueError(f"a limit is a whole amount from ₹{MIN_LIMIT} to ₹{MAX_LIMIT:,}, like /limit 100; it stays ₹{before:,.0f}")
+        self._channels.limit = float(amount)
+        self._store.set_setting("limit", str(int(amount)))
+        log.info("LIMIT: 1 limit = %s (was %g)", amount, before)
+        return f"💰 *1 limit = ₹{int(amount):,}* (was ₹{before:,.0f})\n{self._limit_text()}"
+
+    def _entries_off(self, channel: str) -> str:
+        """Why this channel can't open anything new ('' = it can). /pause stands over /start: one channel can't be let in
+        while all are stopped."""
+        if self._paused:
+            return "PAUSED: no new entries until /resume"
+        if channel in self._stopped:
+            return f"STOPPED: no new entries from {channel} until /start {channel}"
+        return ""
+
+    def _ladder_entries_off(self, ladder: Ladder) -> str:
+        """A tip two channels gave goes on while either of them isn't stopped."""
+        return "" if ladder.confirmed_by and not self._entries_off(ladder.confirmed_by) else self._entries_off(ladder.channel)
+
+    def _set_paused(self, paused: bool) -> str:
+        self._paused = paused
+        self._store.set_setting("paused", "1" if paused else "0")
+        if paused:
+            return "⏸ Paused: no new entries. Bookings, loss cuts and waiting retries still work. /resume to go on."
+        return "▶️ Resumed: new entries allowed." + (f" Still stopped: {', '.join(sorted(self._stopped))}." if self._stopped else "")
+
+    def _channel_named(self, text: str) -> Channel:
+        found = self._channels.named(text)
+        if len(found) == 1:
+            return found[0]
+        names = ", ".join(c.name for c in found or self._channels.all())
+        raise ValueError(f"'{text}' could be {names}" if found else f"no channel '{text}'; the channels are {names}")
+
+    def _stop_command(self, text: str) -> str:
+        """/stop <channel>: no new entries from it, also after a restart. Its open trades stay and its bookset posts still
+        book them; its tips waiting for a first entry are dropped, unless another channel gave them too."""
+        if not text:
+            return (f"⏹ Stopped: {', '.join(sorted(self._stopped))}. /start <channel> to go on." if self._stopped else
+                    f"Nothing is stopped. /stop <channel>: {', '.join(c.name for c in self._channels.all())}")
+        if text.lower() == "all":
+            return self._set_paused(True)
+        channel = self._channel_named(text)
+        if channel.name in self._stopped:
+            return f"⏹ {channel.name} is already stopped. /start {channel.name} to go on."
+        self._stopped.add(channel.name)
+        self._store.set_setting("stopped", json.dumps(sorted(self._stopped)))
+        waiting = [ladder for ladder in self._store.active_ladders(self._mode) if ladder.channel == channel.name
+                   and not ladder.entries and (not ladder.confirmed_by or ladder.confirmed_by in self._stopped)]
+        for ladder in waiting:
+            self._store.end_ladder(ladder.id, f"{channel.name} was stopped")
+        still = [p.selection for p in self._store.unclosed_positions(self._mode) if p.channel == channel.name]
+        log.info("STOPPED %s: %d waiting tips dropped, %d trades stay open", channel.name, len(waiting), len(still))
+        return "\n".join([f"⏹ *{channel.name} stopped*: no new entries from it. /start {channel.name} to go on.",
+                          *([f"{len(waiting)} tip(s) waiting for an entry dropped: {', '.join(ladder.team for ladder in waiting)}."] if waiting else []),
+                          *([f"Open trades stay, its booksets still work: {', '.join(still)}."] if still else [])])
+
+    def _start_command(self, text: str) -> str:
+        if text.lower() == "all":
+            return self._set_paused(False)
+        channel = self._channel_named(text)
+        self._stopped.discard(channel.name)
+        self._store.set_setting("stopped", json.dumps(sorted(self._stopped)))
+        log.info("STARTED %s", channel.name)
+        return f"▶️ *{channel.name} started*: its new tips are followed." + ("\n⏸ But all entries are paused: /resume." if self._paused else "")
+
     async def _answer(self, yes: bool, number: int) -> str:
         asked = self._asked.pop(number, None)
         if asked is None:
@@ -1939,7 +2049,7 @@ class Pipeline:
         unsettled = [p for p in self._store.unsettled(self._mode)
                      if self._is_running(p.channel) and p.opened_at >= LEDGER_START.isoformat()]
         return results_report(f"({name}{since}, {self._mode})", [c.name for c in self._channels.all()],
-                              self._results(start, until), self._s.unit_stake, unsettled)
+                              self._results(start, until), self._limit_now(), unsettled)
 
     def _settle(self, position_id: int, outcome: str) -> str:
         pos = self._store.position(position_id)
@@ -1956,12 +2066,13 @@ class Pipeline:
         return f"✅ Trade {position_id} ({pos.selection}) settled at {pl:+.2f}."
 
     def _channels_text(self) -> str:
-        lines = ["📡 *Channels*"]
+        lines = [f"📡 *Channels*, 1 limit = ₹{self._limit_now():,.0f}"]
         for channel in self._channels.all():
             ids = ", ".join(str(i) for i in sorted(channel.ids)) or "none yet"
             extra = f", title /{channel.title_regex}/" if channel.title_regex else ""
+            stopped = " ⏹ STOPPED" if channel.name in self._stopped else ""
             lines.append(f"• {channel.name} ({channel.profile.name}{'' if channel.profile.trade else ', watch only'})"
-                         f": {ids}{extra}")
+                         f": {ids}{extra}{stopped}")
         return "\n".join(lines)
 
     # --- helpers ---------------------------------------------------------------------------------
@@ -2015,7 +2126,7 @@ class Pipeline:
             self._last_entry[sig.channel] = (entry, result.status)
             self._entries.setdefault(sig.channel, deque(maxlen=10)).append((entry, result.status))
             if result.status in COUNTED:
-                self._store.open_position(entry, self._mode, result.price, result.stake)
+                self._store.open_position(entry, self._mode, result.price, result.stake, self._risk.cfg(sig).unit_stake)
         elif sig.action == "exit" and result.status in COUNTED:
             self._store.set_exit(check.position.id, sig.odds, result.stake, result.status)
         elif sig.action == "close" and result.status in ("placed", "simulated") and check.position:
@@ -2053,11 +2164,6 @@ async def run(signals_only: bool) -> None:
     store = Store(DATA_DIR / "trades.db")
     risk = RiskManager(settings, store, mode, channels)
     bot = None if signals_only else ExchangeBot(settings, risk)
-    log.info("Mode: %s | 1 unit = %g | max units/bet %s | odds tolerance %g%% | channels: %s", mode,
-             settings.unit_stake, settings.max_units_per_bet or "off", settings.odds_tolerance * 100,
-             ", ".join(c.name for c in channels.all()) + (" (TELEGRAM_CHAT, no channels.json)" if channels.single else ""))
-    if mode == "live":
-        log.warning("LIVE MODE: real bets will be placed")
 
     transcriber = None
     if channels.any_voice():
@@ -2071,6 +2177,11 @@ async def run(signals_only: bool) -> None:
 
     notifier = Notifier(settings.alert_chat, settings.alerts)
     pipeline = Pipeline(settings, mode, bot, risk, store, notifier, channels)
+    log.info("Mode: %s | 1 unit = %g | max units/bet %s | odds tolerance %g%% | channels: %s", mode,
+             pipeline._limit_now(), settings.max_units_per_bet or "off", settings.odds_tolerance * 100,
+             ", ".join(c.name for c in channels.all()) + (" (TELEGRAM_CHAT, no channels.json)" if channels.single else ""))
+    if mode == "live":
+        log.warning("LIVE MODE: real bets will be placed")
     if bot:
         bot.resolve_name = pipeline._parser.resolve_name  # 'Tallon' -> the site's 'T Griekspoor'
     log.info("AI: %s | alerts to %s: %s", pipeline._parser.name, settings.alert_chat, "on" if settings.alerts else "off")

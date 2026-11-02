@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 CHANNELS_FILE = ROOT / "channels.json"
 DEFAULT = "default"  # name of the single-chat channel used without channels.json
 MANUAL = "manual"  # strict commands you type in your Telegram Saved Messages
+SPORT_NAMES = ("tennis", "cricket")
 
 # .env settings a channel may set differently for its own trades
 OVERRIDABLE = {"unit_stake", "max_units_per_bet", "min_odds", "max_odds", "odds_tolerance", "odds_tolerance_abs",
@@ -82,6 +83,7 @@ class Channels:
         self.single = single  # no channels.json: every message comes from the one TELEGRAM_CHAT
         self._channels = {c.name: c for c in channels}
         self._settings: dict[str, Settings] = {}
+        self.limit: float | None = None  # /limit: rupees of 1 limit for new trades; None = UNIT_STAKE
         for channel in channels:
             self._settings[channel.name] = _apply(base, channel.profile)
         manual = Channel(MANUAL, Profile(MANUAL, strict_only=True))
@@ -137,8 +139,28 @@ class Channels:
     def by_title(self, title: str) -> Channel | None:
         return next((c for c in self._channels.values() if c.title_matches(title)), None)
 
-    def settings_for(self, name: str) -> Settings:
-        return self._settings.get(name, self.base)
+    def named(self, text: str) -> list[Channel]:
+        """The channels a name typed in a command can mean: the one of exactly that name, else those with a word starting
+        with it ('sk' is SK Astro, 'professor' Tennis Professor, 'bossfire' Boss Fire 2.0). A sport names no channel:
+        'tennis' would find only Tennis Professor, and Raftaar would go on."""
+        wanted = " ".join(text.lower().split())
+        exact = [c for c in self.all() if c.name.lower() == wanted]
+        if exact or wanted in SPORT_NAMES or not _compact(wanted):
+            return exact
+        return [c for c in self.all() if re.search(rf"\b{re.escape(wanted)}", c.name, re.IGNORECASE)
+                or _compact(c.name).startswith(_compact(wanted))]
+
+    def settings_for(self, name: str, unit: float | None = None) -> Settings:
+        """The channel's settings at a limit in rupees: unit for a trade already open, else what /limit set, else .env's. A
+        rupee cap on one bet comes down with a smaller limit, so a tip's risk in limits stays the same (Kartik's lay at 75
+        is refused at ₹100 a limit too), and never goes above what .env allows."""
+        settings = self._settings.get(name, self.base)
+        unit = unit or self.limit
+        channel = self._channels.get(name)
+        if not unit or unit == settings.unit_stake or (channel and "unit_stake" in channel.profile.settings):
+            return settings
+        scale = min(1.0, unit / settings.unit_stake) if settings.unit_stake else 1.0
+        return replace(settings, unit_stake=unit, max_liability_per_bet=settings.max_liability_per_bet * scale)
 
     def all(self) -> list[Channel]:
         return [c for c in self._channels.values() if c.name != MANUAL]
@@ -170,6 +192,10 @@ class Channels:
                 channel.ids.discard(chat_id)
                 return channel
         return None
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\W", "", text).lower()
 
 
 def _profile(name: str, values: dict) -> Profile:
