@@ -141,6 +141,14 @@
       "act_on_forwards": false
     },
 
+    "kk": {
+      "paper_only": true,
+      "rules": "kk",
+      "rules_only": true,
+      "act_on_forwards": false,
+      "settings": {"auto_bookset_units": 0}
+    },
+
     "skastro": {
       "rules": "sk",
       "rules_first": true,
@@ -230,6 +238,8 @@
       "ids": [-1004333481060]
     },
     {"name": "Tennis Professor", "profile": "winkaro", "ids": [-1001347348870]},
+    {"name": "KK Expert", "profile": "kk", "ids": [-1001716508379],
+     "_comment": "KK EXPERT (KAFEEL KHAN): tennis, one format, read by rules with no AI"},
     {"name": "SK Astro", "profile": "skastro", "ids": [-1002353367477]},
     {"name": "MY Tips", "profile": "my_tips", "ids": [], "title_regex": "^MY Tips",
      "_comment": "the owner's own private Telegram channel: followed by its title; same steps as SK Astro"},

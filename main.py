@@ -434,7 +434,7 @@ class Pipeline:
         if msg.forwarded and not profile.act_on_forwards:  # e.g. a member's "book set maar diya" testimonial
             return [], "forward", ParsedMessage(signals=[], summary="forwarded message (context only)")
         if profile.rules_only:
-            found = parse_known(msg.text, profile.rules) or []
+            found = parse_known(msg.text, profile.rules, msg.reply_to) or []
             summary = ", ".join(s.selection for s in found) or "not one of its formats"
             return [as_bet(s, channel.name) for s in found], "rule-only" if found else "none", \
                 ParsedMessage(signals=found, summary=summary)
@@ -447,7 +447,7 @@ class Pipeline:
         elif msg.voice and not VOICE_WORDS.search(msg.text):
             return [], "voice", ParsedMessage(signals=[], summary="voice note without instruction words (not sent to "
                                                                   "the AI)")
-        rule = None if msg.voice else parse_known(msg.text, profile.rules)
+        rule = None if msg.voice else parse_known(msg.text, profile.rules, msg.reply_to)
         if profile.ai_filter and not rule and not msg.voice and not (
                 AI_WORDS.search(msg.text) or (profile.entry_words and re.search(profile.entry_words, msg.text, re.I))):
             # a text, or a photo's caption, with no instruction word; a bare photo where tips always come in words
@@ -554,6 +554,20 @@ class Pipeline:
             held = self._trade_in_match_of(sig, channel)
             if held:  # 'BACKED INDIA 3.05', then 'Loss cut @1.74 NZ': the team named is where the price is
                 sig = sig.model_copy(update={"selection": held.selection, "event": held.event, "aka": ""})
+            elif channel.profile.rules_only and not channel.profile.ladder and not self._store.find_pending(
+                    sig.selection, self._mode, "entry", channel.name):
+                # its entry was never taken: the site has nothing to book, and looking would only alert 'book it by hand'
+                reason = f"nothing to book: {channel.name} holds no trade on {sig.selection or 'any player'}"
+                await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+                return
+        if sig.action == "add" and not sig.selection.strip(" ?"):
+            # KK Expert: '22p SHNAIDER HALF LIMIT' names the favourite: more on the channel's trade in that match
+            held = self._open_trade(sig, channel) if sig.event.startswith("?") else self._trade_in_match_of(sig, channel)
+            if held is None:
+                reason = f"no trade of {channel.name} to add to"
+                await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+                return
+            sig = sig.model_copy(update={"selection": held.selection, "event": held.event, "aka": "", "side": held.side})
         if sig.action == "stake":
             await self._stake_message(sig, channel, message_id)
             return

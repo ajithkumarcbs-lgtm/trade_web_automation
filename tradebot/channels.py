@@ -34,7 +34,7 @@ class Profile:
     name: str
     trade: bool = True  # False: only watched (e.g. for new group links), never traded
     rules: str = ""  # rule set that double-checks the AI on the usual formats: tipster | ss | tennistv | david | mine |
-    # sk | panther_toss | ""
+    # sk | panther_toss | kk | ""
     rules_only: bool = False  # only what the rule set reads; no AI (a channel of one format, which the AI can only misread)
     rules_first: bool = False  # what the rule set reads goes without the AI, whose free limit can run out; the rest goes to it
     strict_only: bool = False  # only the strict command format (BACK Shelton 3.25 1u ...); no AI
@@ -208,7 +208,7 @@ def _profile(name: str, values: dict) -> Profile:
         raise SystemExit(f"channels.json: profile '{name}' can't override {', '.join(sorted(bad))} "
                          f"(allowed: {', '.join(sorted(OVERRIDABLE))})")
     rules = values.get("rules", "")
-    if rules not in ("", "tipster", "ss", "tennistv", "david", "mine", "sk", "panther_toss"):
+    if rules not in ("", "tipster", "ss", "tennistv", "david", "mine", "sk", "panther_toss", "kk"):
         raise SystemExit(f"channels.json: profile '{name}' has unknown rules '{rules}' "
                          f"(tipster, ss, tennistv, david, mine or empty)")
     try:

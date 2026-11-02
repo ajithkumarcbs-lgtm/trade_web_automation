@@ -123,6 +123,16 @@ TOSS_CALL = re.compile(r"\btoss(?:\s+winner)?\s*(?:👉|:)\s*#?\s*(?P<team>[A-Za
 TOSS_LIST_ITEM = re.compile(r"^\s*\d+\.\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.MULTILINE)
 TOSS_NAMES = {"newzealand": "new zealand", "srilanka": "sri lanka", "westindies": "west indies", "southafrica": "south africa",
               "melbourne r": "melbourne renegades", "melbourne star": "melbourne stars"}
+# KK Expert: 'TENNIS MATCH / FERNANDEZ PLUS KARO GUYS / #KK' backs that player, 1 limit (his rule: 'har match 1 limit se').
+# 'LOSS CUT BOOK SET KARO', his words for any booking, is a reply to the entry it is about. So is a booking told as done, which
+# without the reply could be any open trade: 'Sidha 1.5-1.5 limit ki bookset' comes after the booking, about the last one.
+KK_ENTRY = re.compile(r"\b(?:tennis|running) match (?P<name>[a-z][a-z' -]{1,30}?) ?(?:plus )?(?:karo|kro+)\b")
+KK_CLOSE = re.compile(r"\bloss ?cut book ?set\b|\bbook ?set (?:karo|karte chalna)\b|\bcash ?out (?:kr|kar) lo\b")
+KK_CLOSE_TOLD = re.compile(r"\bbook ?set (?:game |match )?(?:pass|done)\b|\bbook (?:done|bana)\b|\bloss ?cut\b")
+# '22p SHNAIDER HALF LIMIT OR USE KARO UDEGA', '25p OPTION HAI / HALF LIMIT SE OR KHAO', a reply: half a limit more on his entry's
+# side at the price now. A limit is what is risked: 1 limit on Fernandez at 2.56 and half at 5.5 is his 'sidha 2.5-2.5 limit'
+# when booked at 1.35, as Quinn's '1.5 limit loss pr, 4 limit plus' is at 25p. The name is the favourite, not his player.
+KK_ADD = re.compile(r"^\d{1,2} ?p (?:(?!option)(?P<name>[a-z]+) )?(?:option (?:hai )?)?(?P<units>half|\d(?:\.\d)?) limit\b")
 CLOSE_WORDS = r"(?P<word>bookset|book set|boookset|bookser|losscut|loss cut|cashout|book pannuga|book pannunga)"
 # "Bookset coming", "Ready for bookset", "Japan trade possible ... boookset": not yet
 # "Cashout khudse kr lena" (cash out yourself): the tipster gives no exit, so no close either
@@ -159,10 +169,35 @@ def _toss_calls(text: str) -> list[BetSignal] | None:
                       loss_cut=False, confidence=1.0) for team in teams]
 
 
-def parse_known(text: str, rules: str) -> list[BetSignal] | None:
-    """A signal when the message is exactly one of the tipster's usual formats, else None."""
+def _kk_player(text: str) -> str:
+    """The player of a KK Expert entry post, '' when it isn't one."""
+    found = KK_ENTRY.search(normalise(text))
+    return found["name"].strip().title() if found else ""
+
+
+def _kk_calls(text: str, reply_to: str) -> list[BetSignal] | None:
+    """His entries, bookings and adds. An add with no player acts on the trade in the match it names, else the latest one."""
+    line, replied = normalise(text), _kk_player(reply_to)
+    if player := _kk_player(text):
+        found = _signal("entry", player)
+    elif KK_CLOSE.search(line) or (replied and KK_CLOSE_TOLD.search(line)):
+        found = _signal("close", replied, loss_cut=True)
+    elif add := KK_ADD.match(line):
+        named = add["name"].title() if add["name"] and not replied else ""
+        found = _signal("add", replied, units=_units(add["units"]))
+        if named:
+            found = found.model_copy(update={"event": f"{named} v ?"})
+    else:
+        return None
+    return [found.model_copy(update={"sport": "tennis"})]
+
+
+def parse_known(text: str, rules: str, reply_to: str = "") -> list[BetSignal] | None:
+    """A signal when the message is exactly one of the tipster's usual formats, else None. reply_to: the message it answers."""
     if not rules:
         return None
+    if rules == "kk":
+        return _kk_calls(text, reply_to)
     if rules == "panther_toss":
         return _toss_calls(text)
     if rules == "sk" and (calls := [m["name"].strip() for m in SK_ENTRY.finditer(text)]):
