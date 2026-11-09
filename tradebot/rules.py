@@ -116,8 +116,9 @@ MY_ENTRY = re.compile(r"^\s*(?:.*\bvs?\.?\s+\S+\s+)?(?P<name>[A-Za-z][A-Za-z .]*
                       re.IGNORECASE | re.MULTILINE)
 # SK Astro's calls: 'UAE Toss or Match Win', 'Sri Lanka Even or Win', 'IND Even or 50p', 'Eng win or Bookset'. A line that ends
 # in a tick is a result: 'Sydney Match Win ✅' (the pipeline asks whether its match is still to come)
-SK_ENTRY = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z .]*?)\s+(?:(?:toss\s+or\s+)?match\s+win|even\s+or\s+(?:win|\d+\s*p)|"
-                      r"win\s+or\s+(?:even|bookset))[ \t]*$", re.IGNORECASE | re.MULTILINE)
+# 'Match NZ Win or Bookset' (under 'Toss NZ') names NZ; 'Pokhara Bookset or Win' (9 Nov) is the same call the other way round.
+SK_ENTRY = re.compile(r"^\s*(?:match\s+)?(?P<name>[A-Za-z][A-Za-z .]*?)\s+(?:(?:toss\s+or\s+)?match\s+win|even\s+or\s+(?:win|\d+\s*p)|"
+                      r"win\s+or\s+(?:even|bookset)|bookset\s+or\s+win)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 # PANTHER TOSS: 'TOSS 👉 #SYDNEY_THUNDER_W', 'TOSS WINNER : #Sydney Sixers', 'TOSS WINNER #MELBOURNE STARS', 'Next 3 Match
 # Tosses / 1. NZ / 2. IRELAND'
 TOSS_CALL = re.compile(r"\btoss(?:\s+winner)?\s*(?:👉|:|(?=#))\s*#?\s*(?P<team>[A-Za-z][A-Za-z_ ]*)", re.IGNORECASE)

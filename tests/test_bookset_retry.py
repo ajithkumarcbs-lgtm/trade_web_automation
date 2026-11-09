@@ -146,6 +146,15 @@ def test_heartbeat_text(store):
     assert "Bot running" in text and "1 entries" in text and "Vilius Gaubas" in text
 
 
+def test_a_price_moved_in_the_bet_delay_is_tried_again():
+    """3-9 Nov: 'Cannot place bet. Odds is not correct.' refused 5 cashouts and 4 entries, and none was tried again
+    (Panther's loss cut on Sydney Thunder, 8 Nov, ran to a full -50). Balance and the user's limits still end a tip."""
+    from tradebot.exchange_bot import _entry_retryable, _retryable
+    refusal = "Cannot place bet. Odds is not correct."
+    assert _retryable(refusal) and _entry_retryable(refusal)
+    assert not _entry_retryable("Insufficient balance") and not _entry_retryable("stake 5 is below the site's Min Bet 10")
+
+
 def test_gives_up_with_an_alert_after_the_retry_window(store):
     pipe, site = setup(store, refusals=99, bookset_retry_min=0)
     asyncio.run(pipe.execute(signal(odds=3.7, units=1, **GAUBAS)))

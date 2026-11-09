@@ -449,7 +449,8 @@ def test_the_status_shows_everything_about_a_tip(store):
 
 def test_skes_usual_calls_are_read_without_the_ai():
     for text, name in (("UAE Toss or Match Win", "UAE"), ("Adelaide Toss or Match Win", "Adelaide"), ("Sri Lanka Even or Win\n\nEqual Match", "Sri Lanka"),
-                       ("IND Even or 50p", "IND"), ("Eng win or Bookset", "Eng"), ("Sydney Match Win", "Sydney")):
+                       ("IND Even or 50p", "IND"), ("Eng win or Bookset", "Eng"), ("Sydney Match Win", "Sydney"),
+                       ("NZ vs IND \n\nToss NZ\nMatch NZ Win or Bookset", "NZ"), ("Pokhara Bookset or Win", "Pokhara")):
         (sig,) = parse_known(text, "sk")
         assert (sig.action, sig.selection, sig.side) == ("entry", name, "back"), text
     assert [s.selection for s in parse_known("UAE Toss or Match Win\nAdelaide Toss or Match Win", "sk")] == ["UAE", "Adelaide"]

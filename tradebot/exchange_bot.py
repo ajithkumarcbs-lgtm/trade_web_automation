@@ -1062,10 +1062,12 @@ def _entry_retryable(reason: str) -> bool:
 
 
 def _retryable(message: str) -> bool:
-    """Site refusals that pass by themselves: a point in play, the bet delay, a suspended market."""
+    """Site refusals that pass by themselves: a point in play, the bet delay, a suspended market, and the price
+    moving during the bet delay ("Cannot place bet. Odds is not correct.": 9 refusals 3-9 Nov, entries and cashouts,
+    none retried until then; a retry reads the price again, so an entry still keeps to the tip's price)."""
     text = message.lower()
     return any(word in text for word in ("on going", "ongoing", "going on", "suspend", "running", "try again",
-                                         "unmatch"))
+                                         "unmatch", "odds is not correct", "odds not correct"))
 
 
 def _to_float(text: str | None) -> float | None:
