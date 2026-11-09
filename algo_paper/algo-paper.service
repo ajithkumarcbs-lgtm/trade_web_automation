@@ -1,0 +1,23 @@
+# Paper algo on the server, beside the live bot (tradebot.service). No login, no bets.
+# Its own folder (~/algo: algo_paper/, .env with ALGO_BOT_TOKEN / ALGO_CHAT_ID only); it imports Cricbuzz and name
+# helpers from ~/tradebot read-only. Capped and low priority so it can never take memory or CPU from the live bot.
+[Unit]
+Description=Paper algo test (no login, no bets)
+After=network-online.target tradebot.service
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/algo
+Environment=PYTHONPATH=/home/ubuntu/algo:/home/ubuntu/tradebot
+ExecStart=/home/ubuntu/tradebot/.venv/bin/python -m algo_paper.live
+Restart=always
+RestartSec=60
+Nice=10
+CPUWeight=30
+IOWeight=30
+MemoryHigh=330M
+MemoryMax=400M
+MemorySwapMax=100M
+
+[Install]
+WantedBy=multi-user.target

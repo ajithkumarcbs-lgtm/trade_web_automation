@@ -181,11 +181,15 @@ class Runner:
 
     async def run(self) -> None:
         async with async_playwright() as pw:
+            args = ["--disable-dev-shm-usage", "--disable-gpu"]
             try:
-                browser = await pw.chromium.launch(headless=True)
+                browser = await pw.chromium.launch(headless=True, args=args)
             except Exception:  # no bundled Chromium (this PC): the installed Chrome
-                browser = await pw.chromium.launch(headless=True, channel="chrome")
+                browser = await pw.chromium.launch(headless=True, channel="chrome", args=args)
             ctx = await browser.new_context(viewport={"width": 1400, "height": 1000})  # fresh: logged out
+            # prices are text: no pictures, video or fonts, to keep memory low next to the live bot
+            await ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in
+                            ("image", "media", "font") else route.continue_())
             self.list_page = await ctx.new_page()
             self.ctx = ctx
             last_list = 0.0
