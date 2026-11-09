@@ -181,7 +181,7 @@ class Runner:
 
     async def run(self) -> None:
         async with async_playwright() as pw:
-            args = ["--disable-dev-shm-usage", "--disable-gpu"]
+            args = ["--disable-dev-shm-usage", "--disable-gpu", "--renderer-process-limit=2"]
             try:
                 browser = await pw.chromium.launch(headless=True, args=args)
             except Exception:  # no bundled Chromium (this PC): the installed Chrome

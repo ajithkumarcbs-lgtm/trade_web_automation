@@ -1,6 +1,8 @@
 # Paper algo on the server, beside the live bot (tradebot.service). No login, no bets.
 # Its own folder (~/algo: algo_paper/, .env with ALGO_BOT_TOKEN / ALGO_CHAT_ID only); it imports Cricbuzz and name
-# helpers from ~/tradebot read-only. Capped and low priority so it can never take memory or CPU from the live bot.
+# helpers from ~/tradebot read-only. On the 1 GB t3.micro it is held small and low so it never takes from the live bot:
+# 220 MB of RAM (the rest of it goes to swap, its own pages first), a fifth of one CPU (an open iob7 page can burn a
+# whole core, and t3 CPU credits are shared), lowest priority. guard.sh stops it if the server runs short of memory.
 [Unit]
 Description=Paper algo test (no login, no bets)
 After=network-online.target tradebot.service
@@ -10,14 +12,15 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/algo
 Environment=PYTHONPATH=/home/ubuntu/algo:/home/ubuntu/tradebot
 ExecStart=/home/ubuntu/tradebot/.venv/bin/python -m algo_paper.live
-Restart=always
-RestartSec=60
-Nice=10
-CPUWeight=30
-IOWeight=30
-MemoryHigh=330M
-MemoryMax=400M
-MemorySwapMax=100M
+Restart=on-failure
+RestartSec=120
+Nice=15
+CPUQuota=20%
+CPUWeight=20
+IOWeight=20
+MemoryHigh=180M
+MemoryMax=220M
+MemorySwapMax=400M
 
 [Install]
 WantedBy=multi-user.target
