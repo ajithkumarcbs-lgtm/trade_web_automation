@@ -122,6 +122,24 @@ class Ledger:
         return {algo: (n, pl or 0.0) for algo, n, pl in self.db.execute(
             "SELECT algo, COUNT(*), SUM(pl) FROM trades WHERE closed_at >= ? GROUP BY algo", (since,))}
 
+    def day_stats(self, day: str) -> dict[str, list]:
+        """algo -> [trades, up, down, P/L] of the trades closed on a day ('2026-11-10')."""
+        out: dict[str, list] = {}
+        for algo, pl in self.db.execute("SELECT algo, pl FROM trades WHERE substr(closed_at, 1, 10) = ?", (day,)):
+            s = out.setdefault(algo, [0, 0, 0, 0.0])
+            s[0] += 1
+            s[1] += int((pl or 0) > 0)
+            s[2] += int((pl or 0) < 0)
+            s[3] += pl or 0
+        return out
+
+    def matches_on(self, day: str) -> int:
+        return self.db.execute("SELECT COUNT(DISTINCT event) FROM snapshots WHERE substr(ts, 1, 10) = ?",
+                               (day,)).fetchone()[0]
+
+    def open_trades(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM trades WHERE closed_at IS NULL").fetchone()[0]
+
 
 @dataclass
 class Open:

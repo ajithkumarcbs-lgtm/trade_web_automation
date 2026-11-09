@@ -38,6 +38,8 @@ LIVE = {"in progress", "innings break", "toss", "delay", "rain", "drink", "strat
 STOP_WORDS = ("BOOKMAKER", "FANCY", "PREMIUM", "LIVE STREAMING", "PLACE BET", "OPEN BETS", "TIED MATCH",
               "COMPLETED MATCH", "TOSS", "WHO WILL")
 SUSPENDED = {"SUSPENDED", "BALL RUNNING", "BALL START", "CLOSED"}
+SUMMARY_AT = (23, 30)  # the daily Telegram summary, local time
+TEST_START = "2026-11-09T19:00"  # the week's test began 9 Nov 19:45
 
 log = logging.getLogger("algo")
 
@@ -178,6 +180,23 @@ class Runner:
         self.cricbuzz = Cricbuzz()
         self.tracked: dict[str, Tracked] = {}
         self.urls: dict[str, str] = {}
+        now_dt = datetime.now()
+        # started after today's summary time: today's summary went out already (or the day began before the test)
+        self.summary_day = now_dt.date() if (now_dt.hour, now_dt.minute) >= SUMMARY_AT else None
+
+    def daily_text(self, day: str) -> str:
+        """The day's summary for Telegram: each algo's closed trades, and the test so far."""
+        stats, week = self.ledger.day_stats(day), self.ledger.totals_since(TEST_START)
+        lines = [f"📊 ALGO DAILY · {datetime.strptime(day, '%Y-%m-%d'):%d %b} (paper, no real money)",
+                 f"Matches read: {self.ledger.matches_on(day)}"]
+        for algo in ("value-mo", "value-bm", "ladder-mo"):
+            n, up, down, pl = stats.get(algo, [0, 0, 0, 0.0])
+            lines.append(f"{algo}: {n} trades ({up} up, {down} down) {pl:+.2f}")
+        total = sum(s[3] for s in stats.values())
+        week_n, week_pl = sum(n for n, _ in week.values()), sum(pl for _, pl in week.values())
+        lines += [f"Today: {total:+.2f}", f"Test so far (from 9 Nov): {week_n} trades, {week_pl:+.2f}",
+                  f"Open now: {self.ledger.open_trades()}"]
+        return "\n".join(lines)
 
     async def run(self) -> None:
         async with async_playwright() as pw:
@@ -207,6 +226,11 @@ class Runner:
                         await self.read(tracked)
                     except Exception:
                         log.exception("read %s", tracked.event)
+                now_dt = datetime.now()
+                if (not self.once and (now_dt.hour, now_dt.minute) >= SUMMARY_AT
+                        and self.summary_day != now_dt.date()):
+                    self.summary_day = now_dt.date()
+                    self.alerts.add(self.daily_text(now_dt.strftime("%Y-%m-%d")))
                 if self.alerts.queue:
                     await asyncio.to_thread(self.alerts.flush)
                 if self.once:

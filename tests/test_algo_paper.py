@@ -105,6 +105,18 @@ def test_open_paper_trades_carry_on_after_a_restart(tmp_path):
     assert sent and "+50.00" in sent[-1] and ledger.totals_since("2000-01-01")["value-mo"] == (1, 50.0)
 
 
+def test_the_daily_summary_counts_each_algo(tmp_path, monkeypatch):
+    import algo_paper.live as live
+    from algo_paper.paper import Ledger
+    monkeypatch.setattr(live, "DATA", tmp_path)
+    runner = live.Runner(once=True)
+    tid = runner.ledger.open("value-mo", "A v B", "A", [("back", 50, 2.0)], "t")
+    runner.ledger.close(tid, "bookset", 21.43)
+    day = runner.ledger.db.execute("SELECT substr(closed_at, 1, 10) FROM trades").fetchone()[0]
+    text = runner.daily_text(day)
+    assert "value-mo: 1 trades (1 up, 0 down) +21.43" in text and "ladder-mo: 0 trades" in text and "Open now: 0" in text
+
+
 def test_team_names_and_results():
     assert same_side("Kathmandu Gurkhas", "Kathmandu Gorkhas") and same_side("Hobart Hurricanes W", "Hobart Hurricanes Women")
     assert not same_side("Sydney Sixers W", "Sydney Thunder Women")
