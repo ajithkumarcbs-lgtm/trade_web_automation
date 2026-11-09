@@ -22,6 +22,7 @@ from playwright.async_api import async_playwright
 from tradebot.fancy import Cricbuzz, Match
 from tradebot.names import name_score
 
+from .alerts import Alerts
 from .model import balls_left_in_match, blended, logit, p_bat_first
 from .paper import JUMP, LadderAlgo, Ledger, MatchView, Price, ValueAlgo
 
@@ -167,8 +168,13 @@ class Runner:
     def __init__(self, once: bool) -> None:
         self.once = once
         self.ledger = Ledger(DATA / "algo.db")
-        self.algos = [ValueAlgo("value-mo", self.ledger, log), ValueAlgo("value-bm", self.ledger, log),
-                      LadderAlgo("ladder-mo", self.ledger, log)]
+        self.alerts = Alerts()
+        notify = None if once else self.alerts.add
+        self.algos = [ValueAlgo("value-mo", self.ledger, log, notify), ValueAlgo("value-bm", self.ledger, log, notify),
+                      LadderAlgo("ladder-mo", self.ledger, log, notify)]
+        log.info("Telegram alerts %s", "on" if self.alerts.on else "off (no ALGO_BOT_TOKEN / ALGO_CHAT_ID in .env)")
+        if notify:
+            notify("📐 Algo paper test running (no login, no real money). Alerts: entries, bookings, results.")
         self.cricbuzz = Cricbuzz()
         self.tracked: dict[str, Tracked] = {}
         self.urls: dict[str, str] = {}
@@ -197,6 +203,8 @@ class Runner:
                         await self.read(tracked)
                     except Exception:
                         log.exception("read %s", tracked.event)
+                if self.alerts.queue:
+                    await asyncio.to_thread(self.alerts.flush)
                 if self.once:
                     break
                 await asyncio.sleep(READ_S)
@@ -269,6 +277,10 @@ class Runner:
             for algo in self.algos:
                 algo.settle(t.event, winner)
             log.info("FINISHED %s: %s", t.event, t.match.status)
+            today = self.ledger.totals_since(datetime.now().strftime("%Y-%m-%dT00:00"))
+            lines = "\n".join(f"{name}: {n} trades, {pl:+.2f}" for name, (n, pl) in sorted(today.items())) or "no trades"
+            if not self.once:
+                self.alerts.add(f"🏁 ALGO match over: {t.event}\n{t.match.status}\nToday (paper):\n{lines}")
             await t.tab.close()
             self.tracked.pop(t.event, None)
             return
@@ -317,11 +329,14 @@ class Runner:
         if t.no_trade:
             jumped = True  # rain rules: no new trades; open ones are still managed
         chances = {bat_first: p, other: 1 - p}
+        overs = f"{balls // 6}.{balls % 6} ov"
+        context = (f"{bat_first} {runs}/{wkts} ({overs})" if innings == 1 else
+                   f"{other} {runs}/{wkts} ({overs}), need {target - runs} off {120 - balls}")
         for algo in self.algos:
             prices = bm if algo.name.endswith("-bm") else mo
             if len(prices) < 2:
                 continue
-            algo.on_read(MatchView(t.event, bat_first, other, chances, prices, jumped))
+            algo.on_read(MatchView(t.event, bat_first, other, chances, prices, jumped, context))
         if self.once:
             log.info("%s: innings %d %d/%d (%d balls%s), %s batted first: model %.2f blended %.2f market %s | MO %s | BM %s",
                      t.event, innings, runs, wkts, balls, f", target {target}" if target else "", bat_first, p_model, p,

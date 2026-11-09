@@ -90,6 +90,21 @@ def test_booking_arithmetic_matches_the_real_trades():
     assert book([("lay", 50, 1.47), ("lay", 50, 1.18), ("lay", 50, 1.04)]) == (-34.5, 150)  # Renegades, 7 Nov
 
 
+def test_open_paper_trades_carry_on_after_a_restart(tmp_path):
+    import logging
+    from algo_paper.paper import LadderAlgo, Ledger, ValueAlgo
+    ledger = Ledger(tmp_path / "algo.db")
+    ledger.open("value-mo", "A v B", "A", [("lay", 50, 2.2)], "test")
+    ledger.open("ladder-mo", "A v B", "B", [("lay", 50, 1.4), ("lay", 50, 1.15)], "test")
+    sent = []
+    value = ValueAlgo("value-mo", ledger, logging.getLogger("t"), sent.append)
+    ladder = LadderAlgo("ladder-mo", ledger, logging.getLogger("t"), sent.append)
+    assert value.open["A v B"].legs == [("lay", 50, 2.2)] and value.count["A v B"] == 1
+    assert ladder.steps["A v B"] == {0, 1}
+    value.settle("A v B", "B")  # A lost: the lay wins its stake
+    assert sent and "+50.00" in sent[-1] and ledger.totals_since("2000-01-01")["value-mo"] == (1, 50.0)
+
+
 def test_team_names_and_results():
     assert same_side("Kathmandu Gurkhas", "Kathmandu Gorkhas") and same_side("Hobart Hurricanes W", "Hobart Hurricanes Women")
     assert not same_side("Sydney Sixers W", "Sydney Thunder Women")

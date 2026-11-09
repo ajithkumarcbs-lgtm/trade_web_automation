@@ -111,6 +111,17 @@ class Ledger:
                         (now(), how, round(pl, 2), note, trade_id))
         self.db.commit()
 
+    def trades_of(self, algo: str) -> list[tuple]:
+        """(id, event, runner, legs, opened_at, closed_at) of every trade of an algo, oldest first."""
+        return [(tid, ev, runner, json.loads(legs), opened, closed) for tid, ev, runner, legs, opened, closed in
+                self.db.execute("SELECT id, event, runner, legs, opened_at, closed_at FROM trades WHERE algo = ? "
+                                "ORDER BY id", (algo,))]
+
+    def totals_since(self, since: str) -> dict[str, tuple[int, float]]:
+        """algo -> (closed trades, P/L) since a time."""
+        return {algo: (n, pl or 0.0) for algo, n, pl in self.db.execute(
+            "SELECT algo, COUNT(*), SUM(pl) FROM trades WHERE closed_at >= ? GROUP BY algo", (since,))}
+
 
 @dataclass
 class Open:
@@ -130,16 +141,27 @@ class MatchView:
     p: dict[str, float]  # runner -> chance
     prices: dict[str, Price]
     jumped: bool  # the market moved JUMP or more in the last minute
+    context: str = ""  # the score, for alerts
 
 
 class ValueAlgo:
-    def __init__(self, name: str, ledger: Ledger, log) -> None:
+    def __init__(self, name: str, ledger: Ledger, log, notify=None) -> None:
         self.name, self.ledger, self.log = name, ledger, log
+        self.notify = notify or (lambda text: None)
         self.open: dict[str, Open] = {}
         self.count: dict[str, int] = {}
         self.last_exit: dict[str, datetime] = {}
         self.seen: dict[str, tuple] = {}  # event -> the candidate read last time
         self.order: dict[str, tuple] = {}  # event -> (runner, side) to fill at this read
+        self.restore()
+
+    def restore(self) -> None:
+        """After a restart: open trades go on being managed, and trades already made count for their match."""
+        for tid, ev, runner, legs, opened, closed in self.ledger.trades_of(self.name):
+            self.count[ev] = self.count.get(ev, 0) + 1
+            if closed is None:
+                self.open[ev] = Open(tid, runner, [tuple(leg) for leg in legs], datetime.fromisoformat(opened))
+                self.log.info("[%s] carried on after a restart: %s %s", self.name, ev, legs)
 
     def _candidate(self, view: MatchView) -> tuple | None:
         best = None
@@ -171,6 +193,8 @@ class ValueAlgo:
                     self.open[ev] = Open(tid, runner, legs, datetime.now())
                     self.count[ev] = self.count.get(ev, 0) + 1
                     self.log.info("[%s] PAPER %s", self.name, note)
+                    self.notify(f"📐 ALGO PAPER ENTRY ({self.name})\n{side.upper()} {runner} @ {odds:g}, ₹50\n{ev}\n"
+                                f"{view.context}\nModel {p:.0%} · Market {1 / odds:.0%}\n(no real money)")
                     return
             self.log.info("[%s] order on %s dropped: the price moved", self.name, runner)
             return
@@ -202,6 +226,8 @@ class ValueAlgo:
     def _close(self, ev: str, held: Open, how: str, pl: float, note: str) -> None:
         self.ledger.close(held.trade_id, how, pl, note)
         self.log.info("[%s] PAPER %s %s %+.2f (%s)", self.name, how.upper(), held.runner, pl, note)
+        icon = "🟢" if pl > 0 else "🔴" if pl < 0 else "⚪"
+        self.notify(f"{icon} ALGO PAPER {how.upper()} ({self.name})\n{held.runner} {pl:+.2f}\n{ev}\n{note}\n(no real money)")
         self.open.pop(ev, None)
         self.last_exit[ev] = datetime.now()
 
@@ -218,10 +244,16 @@ class ValueAlgo:
 
 
 class LadderAlgo(ValueAlgo):
-    def __init__(self, name: str, ledger: Ledger, log) -> None:
-        super().__init__(name, ledger, log)
+    def __init__(self, name: str, ledger: Ledger, log, notify=None) -> None:
         self.steps: dict[str, set] = {}
         self.stopped: set[str] = set()
+        super().__init__(name, ledger, log, notify)
+
+    def restore(self) -> None:
+        super().restore()
+        for ev, held in self.open.items():
+            self.steps[ev] = set(range(len(held.legs)))
+        self.stopped |= {ev for ev in self.count if ev not in self.open}  # booked once already: the method is done
 
     def on_read(self, view: MatchView) -> None:
         ev = view.event
@@ -266,4 +298,6 @@ class LadderAlgo(ValueAlgo):
                 tid = self.ledger.open(self.name, ev, fav, [leg], f"step 1 lay {fav} @{fp.lay:g} ({other} {op.back:g})")
                 self.open[ev] = Open(tid, fav, [leg], datetime.now())
             self.log.info("[%s] PAPER step %d: lay %s @%g", self.name, number + 1, fav, fp.lay)
+            self.notify(f"📐 ALGO PAPER STEP {number + 1} ({self.name})\nLAY {fav} @ {fp.lay:g}, ₹50\n{ev}\n"
+                        f"{view.context}\n(no real money)")
             break
