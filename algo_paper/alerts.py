@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -18,21 +20,35 @@ ENV = Path(__file__).resolve().parent.parent / ".env"
 log = logging.getLogger("algo")
 
 
+TOKEN = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")  # BotFather's form: '1234567890:AAH...'
+
+
 def _env() -> dict[str, str]:
+    """ALGO_* lines of .env; the last well-formed one wins, so a broken paste above a good line does no harm."""
     values = {}
     if ENV.exists():
-        for line in ENV.read_text(encoding="utf-8").splitlines():
-            if line.startswith("ALGO_") and "=" in line:
+        for line in ENV.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            if line.strip().startswith("ALGO_") and "=" in line:
                 key, _, value = line.partition("=")
-                values[key.strip()] = value.strip()
+                key, value = key.strip(), value.strip().strip("'\"").rstrip(",.;")  # a comma copied with it
+                if key == "ALGO_BOT_TOKEN" and not TOKEN.match(value):
+                    continue
+                values[key] = value
     return values
 
 
 def _call(token: str, method: str, params: dict) -> dict:
+    """One Bot API call. An error names Telegram's answer only: the URL holds the token, so it is never shown."""
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=data)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        hint = " (Telegram does not know this token: copy it again from @BotFather)" if exc.code == 401 else ""
+        raise RuntimeError(f"Telegram answered {exc.code} {exc.reason}{hint}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Telegram not reachable: {exc.reason}") from None
 
 
 class Alerts:
@@ -64,7 +80,14 @@ def main() -> None:
     env = _env()
     token = env.get("ALGO_BOT_TOKEN", "")
     if not token:
-        sys.exit("ALGO_BOT_TOKEN is not in .env")
+        sys.exit("no usable ALGO_BOT_TOKEN in .env (it looks like 1234567890:AAH... with no spaces or quotes)")
+    try:
+        _run(token, env)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+
+
+def _run(token: str, env: dict[str, str]) -> None:
     if "--chat-id" in sys.argv:
         updates = _call(token, "getUpdates", {}).get("result", [])
         chats = {u["message"]["chat"]["id"]: u["message"]["chat"].get("first_name", "") for u in updates if "message" in u}
