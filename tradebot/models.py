@@ -78,6 +78,9 @@ class BetSignal(AISignal):
     # An entry held for its match (SK Astro's tips come hours early): tried from this time on, and the price when tipped
     not_before: str = ""
     tip_price: float | None = None
+    # An SK-method lay: the highest lay price its step allows (1.50 for the first). A try the site refused because the price
+    # moved asks a tick or two above the price on offer, up to this, so a small move in the bet delay still matches.
+    worst_odds: float | None = None
 
     def key(self) -> str:
         """Normalised identity used to spot the same tip posted twice."""

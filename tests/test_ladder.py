@@ -9,7 +9,7 @@ from conftest import make_settings, signal
 from main import Pipeline
 from test_channels_rules import CHAT, FakeNotifier, FakeParser, FakeSite, make, msg  # noqa: F401  (the same fakes as the pipeline tests)
 from tradebot.channels import Channel, Channels, Profile
-from tradebot.exchange_bot import TeamQuote
+from tradebot.exchange_bot import BetResult, TeamQuote
 from tradebot.fancy import Match
 from tradebot.ladder import (BOOKSET, EQUAL_EXIT, FELL_BACK, GIVEBACK, WAIT_FAVOURITE, WAIT_PROFIT, Ladder, exit_call, jackpot_days_in,
                              parse_day, read_sk_tip, step_at)
@@ -691,3 +691,74 @@ def test_on_paper_ss_trades_every_day_and_its_jackpot_days_are_reported_apart(st
     store.add_jackpot_day(datetime.now().date(), "test")
     text = asyncio.run(pipe.command("/jackpot"))
     assert "Tip on those days: 1 trades" in text and "Tip on other days: 0 trades" in text
+
+
+class RefusingSite(LadderSite):
+    """Refuses the first `refusals` entries the way the site did on 10 Nov, and notes each entry's worst price."""
+
+    def __init__(self, risk, live=3.0):
+        super().__init__(risk, live)
+        self.refusals, self.worst = 1, []
+
+    async def place(self, sig, position, require_green=False):
+        if sig.action == "entry":
+            self.worst.append(sig.worst_odds)
+            if self.refusals:
+                self.refusals -= 1
+                self.calls.append((sig.action, sig.selection, sig.amount or sig.units))
+                return BetResult("retry", "Unmatch Bet Not Allow.", self.live)
+        return await super().place(sig, position, require_green)
+
+
+def test_a_refused_entry_is_tried_again_in_seconds(store):
+    """10 Nov, MY Tips 'Adelaide strikers win jackpot possible': Hobart was in the first step (1.22-1.41) for 4 minutes of
+    the last over, and the site refused all 6 tries, 20-35 s apart. Adelaide won: a missed limit."""
+    profile = Profile("sk", ladder=True, jackpot_source=True, enter_before_start_min=10)
+    pipe, site, notifier = make(store, profile, {MATCH_WIN: [signal(**UAE)]}, live=1.6, mode="dry_run",
+                                site_class=RefusingSite)
+    pipe._cricbuzz = Scores()
+    tip(pipe, MATCH_WIN)
+    ladder_id = store.active_ladders("dry_run")[0].id
+    look(pipe, site, 1.26)
+    assert len(entries(site)) == 1 and store.find_position("Netherlands", "dry_run") is None
+    assert pipe._ladder_hot[ladder_id] > datetime.now()  # looked at every LADDER_FAST_POLL now
+    assert "refused by the site" in notifier.sent[-1] and "every 3 s" in notifier.sent[-1]
+    look(pipe, site, 1.25)
+    assert store.find_position("Netherlands", "dry_run").stake == 1000
+    assert ladder_id not in pipe._ladder_hot
+    assert site.worst == [1.5, 1.5]  # the first step's top: a refused try may ask a tick or two over the price on offer
+    look(pipe, site, 1.15)
+    assert site.worst[-1] == 1.2  # the second step's top
+
+
+def test_a_lay_tried_again_asks_a_tick_or_two_more_up_to_its_step(store):
+    from tradebot.exchange_bot import ExchangeBot, ticks_up
+    assert (ticks_up(1.25, 2), ticks_up(1.99, 2), ticks_up(2.98, 1), ticks_up(3.0, 1)) == (1.27, 2.02, 3.0, 3.05)
+
+    class Box:
+        value = None
+
+        async def fill(self, text):
+            self.value = text
+
+    class Slip:
+        def __init__(self):
+            self.box = Box()
+
+        def locator(self, _):
+            return self.box
+
+    settings = make_settings()
+    bot = ExchangeBot(settings, RiskManager(settings, store, "dry_run"))
+    lay = signal(side="lay", odds=1.25, amount=50, worst_odds=1.5)
+
+    def cushion(sig, price):
+        slip = Slip()
+        decision, asked = asyncio.run(bot._cushion(sig, slip, bot._risk.price_check(sig, price), price))
+        return asked, slip.box.value, round(decision.liability, 2)
+
+    assert cushion(lay, 1.25) == (1.27, "1.27", 13.5)
+    assert cushion(lay.model_copy(update={"worst_odds": 1.26}), 1.25)[:2] == (1.26, "1.26")
+    assert cushion(lay, 1.5)[:2] == (1.5, None)  # at the step's top already
+    assert cushion(lay.model_copy(update={"worst_odds": None}), 1.25)[:2] == (1.25, None)  # a tipster's lay: as offered
+    assert cushion(signal(odds=2.9), 2.9)[:2] == (2.9, None)  # a back: as offered

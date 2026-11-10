@@ -209,6 +209,10 @@ SK_CALL = re.compile(r"^\s*(?P<team>[A-Za-z][A-Za-z .]*?)\s+(?:toss\s+or\s+)?mat
 SK_CALL_WITHIN = timedelta(hours=3)  # 'Sydney Match Win ✅' this long before a Sydney match is a call; after one, a result
 PASTE_FRESH = timedelta(minutes=3)  # a stamped line pasted from WhatsApp older than this is history, not a tip
 LADDER_POLL = timedelta(seconds=20)  # how often an SK-method match's price is read, once it is on
+# After the site refused an SK-method entry (the price moved), its match is looked at this often, for this long: 10 Nov,
+# Hobart was in the first step for 4 minutes of the last over and 6 tries 20-35 s apart were all refused (Adelaide won).
+LADDER_FAST_POLL = timedelta(seconds=3)
+LADDER_FAST_FOR = timedelta(minutes=2)
 LADDER_LONGEST = timedelta(hours=12)  # a match still on after this isn't watched: nor are its trades (POSITION_WINDOW)
 LADDER_NOT_LISTED = timedelta(minutes=40)  # a tipped match the site still doesn't list this long after its start: missed
 LADDER_GONE_READS = 15  # reads in a row (~5 min) without the match on the site, after it was there: it is over
@@ -329,6 +333,7 @@ class Pipeline:
         self._no_price: dict[int, int] = {}  # trade id -> price checks in a row that found no price
         self._ladder_gone: dict[int, int] = {}  # SK-method tip -> reads in a row that didn't find its match on the site
         self._ladder_blocked: dict[int, str] = {}  # SK-method tip -> why its entry is blocked, told once
+        self._ladder_hot: dict[int, datetime] = {}  # SK-method tip -> looked at every LADDER_FAST_POLL until then
         self._missed_by_limit = 0  # messages not read since the last "AI limit" alert
         self._last_limit_alert = datetime.min
         # What your commands set stays over a restart.
@@ -868,11 +873,12 @@ class Pipeline:
         await self._raise_stake(pos, round(pos.stake + extra, 2), odds, sig, channel, message_id)
 
     async def _raise_stake(self, pos: Position, target: float, odds: float | None, sig: BetSignal,
-                           channel: Channel, message_id: int | None) -> None:
+                           channel: Channel, message_id: int | None, quiet_retry: bool = False) -> BetResult | None:
         """Brings the trade's stake up to target (at most MAX_UNITS_PER_BET), at the price on offer now if it is
-        still close to odds."""
-        def skip(reason: str):
-            return self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+        still close to odds. quiet_retry: a refusal that passes is only returned, not recorded or alerted (the SK method
+        tries again in seconds)."""
+        async def skip(reason: str) -> None:
+            await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
 
         s = self._risk.cfg(pos)
         if s.max_units_per_bet:  # topped up to the most you allow, as a big entry is
@@ -883,18 +889,22 @@ class Pipeline:
                               f"MAX_UNITS_PER_BET counted)")
         add = BetSignal(action="entry", sport=pos.sport, event=pos.event, market=pos.market, market_name="",
                         selection=pos.selection, side=pos.side, odds=odds, line=None, units=None, amount=extra,
-                        loss_cut=False, confidence=1.0, channel=channel.name)
+                        loss_cut=False, confidence=1.0, channel=channel.name, worst_odds=sig.worst_odds)
         async with self._trade_lock(TradeLock.OTHER):
             if self._bot is None:
                 result = self._simulate(add, Decision(True, "ok"))
             else:
                 result = await self._bot.place(add, None)
+            if result.status == "retry" and quiet_retry:
+                log.info("  top-up of %s refused for now: %s", pos.selection, result.reason)
+                return result
             if result.status in COUNTED and result.price:
                 self._store.add_to_position(pos.id, result.stake, result.price)
                 result.reason = f"TOP-UP of {pos.selection} to stake {target:g}: {result.reason}"
             elif result.status == "retry":
                 result = BetResult("skipped", f"top-up not placed: {result.reason}")
             await self._record(message_id, add, result, Decision(False, "top-up"))
+        return result
 
     # --- instructions ----------------------------------------------------------------------------
 
@@ -1224,16 +1234,32 @@ class Pipeline:
                           confidence=1.0, channel=channel.name)]
 
     async def ladder_watcher(self) -> None:
-        """Every LADDER_POLL, one look at each SK-method match that is on."""
+        """A look at each SK-method match that is on every LADDER_POLL, and every LADDER_FAST_POLL at one whose entry the site
+        just refused (_ladder_hurry)."""
         if self._bot is None or not any(c.profile.ladder for c in self._channels.all()):
             return
+        looked: dict[int, datetime] = {}
         while True:
-            await asyncio.sleep(LADDER_POLL.total_seconds())
+            await asyncio.sleep(LADDER_FAST_POLL.total_seconds())
             for ladder in self._store.active_ladders(self._mode):
+                now = datetime.now()
+                if self._ladder_hot.get(ladder.id, datetime.min) <= now and \
+                        now - looked.get(ladder.id, datetime.min) < LADDER_POLL:
+                    continue
+                looked[ladder.id] = now
                 try:
                     await self._ladder_step(ladder)
                 except Exception:
                     log.exception("SK method: could not look at %s", ladder.team)
+
+    async def _ladder_hurry(self, ladder: Ladder, step: int, reason: str) -> None:
+        """The site refused an entry for a reason that passes (the price moved, a suspended market): looked at again in
+        seconds for LADDER_FAST_FOR, told once."""
+        now = datetime.now()
+        if self._ladder_hot.get(ladder.id, datetime.min) <= now:
+            await self._ladder_note(ladder, f"entry {step + 1} refused by the site ({reason}): trying again every "
+                                            f"{LADDER_FAST_POLL.seconds} s while {ladder.other} stays in a step")
+        self._ladder_hot[ladder.id] = now + LADDER_FAST_FOR
 
     async def _ladder_step(self, ladder: Ladder) -> None:
         """Takes the step the price is in, stops the steps after a swing, books or exits by exit_call, ends when nothing
@@ -1369,7 +1395,7 @@ class Pipeline:
             return
         sig = BetSignal(action="entry", sport=ladder.sport, event=quote.event or ladder.event, market="match_odds",
                         market_name="", selection=quote.other, side="lay", odds=quote.lay, line=None, units=None,
-                        amount=unit, loss_cut=False, confidence=1.0, channel=ladder.channel)
+                        amount=unit, loss_cut=False, confidence=1.0, channel=ladder.channel, worst_odds=STEPS[step][1])
         if trade is None:
             async with self._trade_lock(TradeLock.OTHER):
                 check = self._risk.precheck(sig)
@@ -1383,18 +1409,22 @@ class Pipeline:
                     await self._record(ladder.message_id, sig, result, check)
             taken = result.status in COUNTED
         else:
-            await self._raise_stake(trade, round(trade.stake + unit, 2), quote.lay, sig,
-                                    self._channels.get(ladder.channel), ladder.message_id)
+            result = await self._raise_stake(trade, round(trade.stake + unit, 2), quote.lay, sig,
+                                             self._channels.get(ladder.channel), ladder.message_id, quiet_retry=True)
             taken = self._store.position(trade.id).stake > trade.stake
         if not taken:
             log.info("  SK method, %s: entry %d not taken yet", ladder.team, step + 1)
+            if result is not None and result.status == "retry":
+                await self._ladder_hurry(ladder, step, result.reason)
             return
+        self._ladder_hot.pop(ladder.id, None)
         prices = ",".join(filter(None, (ladder.entry_prices, f"{quote.lay:g}")))
         self._store.update_ladder(ladder.id, last_step=step, entries=ladder.entries + 1, entry_prices=prices)
 
     async def _end_ladder(self, ladder: Ladder, reason: str) -> None:
         self._store.end_ladder(ladder.id, reason)
         self._ladder_gone.pop(ladder.id, None)
+        self._ladder_hot.pop(ladder.id, None)
         first = f", {ladder.other} first read at {ladder.first_price:g}" if ladder.first_price else ""
         text = f"{ladder.team}: {reason} ({ladder.entries} of {len(STEPS)} entries{first})"
         log.info("SK method, %s", text)

@@ -37,6 +37,12 @@ RESOLVE_AGAIN = timedelta(minutes=3)  # each ask can be 3 models' calls: kept ra
 RESOLVE_BACKOFF = 7  # and doubled each time it stays unanswered (up to 6 h): an order can wait for days on a match gone
 RESOLVE_LIST_MAX = 200  # matches shown to the AI
 FANCY_OPEN_TRIES = 4  # looks at a fancy row 2 s apart while it says BALL RUNNING
+# A lay with a worst price (an SK-method step) that the site refused because the price moved asks this many ticks above the
+# price on offer: 10 Nov, Hobart's lay at 1.24 -> 1.25 and 1.22 -> 1.23 between reading and clicking, 'Unmatch Bet Not Allow'.
+CUSHION_TICKS = 2
+# Betfair's price ladder (the site mirrors it): below each price, its tick.
+TICKS = ((2.0, 0.01), (3.0, 0.02), (4.0, 0.05), (6.0, 0.1), (10.0, 0.2), (20.0, 0.5), (30.0, 1.0), (50.0, 2.0),
+         (100.0, 5.0), (1000.0, 10.0))
 
 
 @dataclass
@@ -333,15 +339,34 @@ class ExchangeBot:
                 if not decision.ok:
                     raise BetAborted("skipped", f"price moved in the slip: {decision.reason}", slip_price)
                 price = slip_price
+            if attempt and price:
+                decision, price = await self._cushion(sig, slip, decision, price)
             result = await self._submit(sig, slip, decision.stake, decision.liability, price)
             if decision.reason != "ok":  # e.g. IGNORE_SLIPPAGE in a dry run
                 result.reason = f"{result.reason} [{decision.reason}]"
-            moved = result.status == "failed" and sel.PRICE_MOVED_ERROR in result.reason.lower()
-            if not (moved and attempt == 0):
+            if not (result.status == "failed" and _price_moved(result.reason) and attempt == 0):
                 break
             log.info("  price moved before the bet was accepted; checking the new price once more")
         result.name, result.event = runner, match
         return result
+
+    async def _cushion(self, sig: BetSignal, slip: Locator, decision, price: float):
+        """A lay with a worst price, tried again after the price moved: asks CUSHION_TICKS above the price on offer (never
+        above the worst price, nor outside the tip's tolerance), so a tick or two of movement still matches. Only the
+        second try asks it: the first is always at the price on offer. Returns the decision and the price asked."""
+        if sig.side != "lay" or not sig.worst_odds:
+            return decision, price
+        asked = min(ticks_up(price, CUSHION_TICKS), sig.worst_odds)
+        if asked <= price:
+            return decision, price
+        cushioned = self._risk.price_check(sig, asked)
+        if not cushioned.ok:
+            log.info("  no cushion: lay %g would be %s", asked, cushioned.reason)
+            return decision, price
+        await slip.locator(sel.ODDS_INPUT).fill(f"{asked:g}")
+        log.info("  asking lay %g (%g on offer + up to %d ticks, at most %g): a small move in the bet delay still matches",
+                 asked, price, CUSHION_TICKS, sig.worst_odds)
+        return cushioned, asked
 
     async def _place_back_as_lay(self, sig: BetSignal, back_price: float | None) -> BetResult:
         """Back A above MAX_BACK_ODDS = lay B (the only other runner) at B's lay price b, with lay stake
@@ -732,11 +757,14 @@ class ExchangeBot:
     async def _found_by_ai(self, names: list[str], event_name: str, tried: list[str]) -> dict[str, int]:
         """A one-word name the list doesn't have (first name 'Tallon', code 'pkr'): the AI picks the listed side it
         means ('T Griekspoor'), which must be in the list and fit any initial shown. Returns {side: match index}."""
+        initial_of = re.sub(r"\s+v\s+\?$", "", event_name)
         for name in tried:
             key = name.strip(" ?").lower()
             if " " in key or len(key) < 2:  # 'bh' = Brisbane Heat
                 continue
-            when, side, tries = self._resolved.get(key, (datetime.min, None, 0))
+            initial = _tip_initial(initial_of, key)
+            cache = f"{key} {initial}".strip()  # 'Adrian M' and 'Adrian A' are two players
+            when, side, tries = self._resolved.get(cache, (datetime.min, None, 0))
             fresh = datetime.now() - when < (RESOLVED_KEEP if side else RESOLVE_AGAIN * 2 ** min(tries, RESOLVE_BACKOFF))
             if fresh and side is None:
                 continue
@@ -749,7 +777,11 @@ class ExchangeBot:
                 if side and not _initials_fit(key, side):
                     log.warning("  AI says '%s' is %s, but the site's initial doesn't fit: not used", name, side)
                     side = None
-                self._resolved[key] = (datetime.now(), side, 0 if side else tries + 1)
+                if side and not _initial_fits(key, initial, side):
+                    log.warning("  AI says '%s' is %s, but the tip's initial %s doesn't fit: not used", name, side,
+                                initial.upper())
+                    side = None
+                self._resolved[cache] = (datetime.now(), side, 0 if side else tries + 1)
             index = _best_index(names, side, side) if side else None
             if index is not None:
                 log.info("  '%s' is %s in %s (AI, from the site's list)", name, side, names[index])
@@ -1018,16 +1050,23 @@ def _best_index(names: list[str], target: str, selection: str = "") -> int | Non
     """Index of the listed match that best fits the tip (typos allowed); ties go to the closest full name,
     so 'South Africa' picks 'South Africa v Australia' over 'South Africa Legends v Australia Legends'.
     With a selection, only matches that include that player/team are considered."""
-    target = target.lower()
     must_have = selection if selection.strip(" ?") else ""
+    initial = _tip_initial(target, must_have) if must_have else ""
+    target = target.lower()
+
+    def has_player(match_name: str) -> bool:  # and, with an initial in the tip, the side of that name fits it
+        sides = [side for side in _sides(match_name) if contains_player(must_have, side)]
+        return bool(sides) and all(_initial_fits(must_have, initial, side) for side in sides)
+
     scores = [(round(name_score(target, n)), fuzz.ratio(target, n.lower()), -i) for i, n in enumerate(names)
-              if not must_have or contains_player(must_have, n)]
+              if not must_have or has_player(n)]
     if not scores and must_have:
         # A team code the tipster made up ('af' = Amsterdam Flames), or a player's first name ('Tallon' in
         # 'Tallon Griekspoor v Brandon Nakashima'): the one listed match with a side it fits. Two candidates
         # ('af' = Afghanistan too) is a guess, so none.
         fits = [i for i, n in enumerate(names)
-                if any(code_fits(must_have, side) or _first_name_of(must_have, side) for side in _sides(n))]
+                if any(code_fits(must_have, side) or (_first_name_of(must_have, side)
+                                                      and _initial_fits(must_have, initial, side)) for side in _sides(n))]
         return fits[0] if len(fits) == 1 else None
     if not scores:
         return None
@@ -1059,6 +1098,43 @@ def _entry_retryable(reason: str) -> bool:
     return _retryable(reason) or any(word in text for word in (
         "not found", "no price", "slippage", "outside", "price moved", "did not open", "not logged in",
         "max bet is 0", "stayed disabled", "timed out", "could not", "waiting"))
+
+
+def _price_moved(reason: str) -> bool:
+    """The site refused an entry because its price changed: before the click ('Unmatch Bet Not Allow.') or in the bet
+    delay ('Cannot place bet. Odds is not correct.'). Worth a second try at the new price straight away."""
+    text = reason.lower()
+    return sel.PRICE_MOVED_ERROR in text or "odds is not correct" in text or "odds not correct" in text
+
+
+def ticks_up(price: float, ticks: int) -> float:
+    """The price this many ticks higher on Betfair's ladder: 1.25 + 2 = 1.27, 1.99 + 2 = 2.02."""
+    for _ in range(ticks):
+        step = next((tick for top, tick in TICKS if price < top - 1e-9), TICKS[-1][1])
+        price = round(price + step, 2)
+    return price
+
+
+def _tip_initial(target: str, selection: str) -> str:
+    """The letter after the name in a tip like 'WINNER - ADRIAN M' (match 'Adrian M', player 'Adrian') or 'NAKASHIMA B':
+    the start of the player's other name. '' when the tip gives none."""
+    side = re.split(r"\s+v\s+", target.strip(), maxsplit=1, flags=re.IGNORECASE)[0]
+    words = re.findall(r"[a-z]+", side.lower())
+    name = re.findall(r"[a-z]+", selection.lower())
+    if len(words) == 2 and len(words[1]) == 1 and name and words[0] == name[-1]:
+        return words[1]
+    return ""
+
+
+def _initial_fits(selection: str, initial: str, side: str) -> bool:
+    """A listed side that has the tip's name ('Adrian Andreev' for 'Adrian M') must have another name starting with the
+    tip's initial. 10 Nov: 'WINNER - ADRIAN M' (Mannarino) opened 'Adrian Andreev v Pietri'. A side listed by one name
+    only ('Mannarino') can't be checked and fits."""
+    if not initial:
+        return True
+    name = set(re.findall(r"[a-z]+", selection.lower()))
+    others = [w for w in re.findall(r"[a-z]+", side.lower()) if w not in name]
+    return not others or any(w.startswith(initial) for w in others)
 
 
 def _retryable(message: str) -> bool:

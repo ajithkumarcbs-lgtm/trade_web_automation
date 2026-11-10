@@ -117,6 +117,28 @@ def test_the_daily_summary_counts_each_algo(tmp_path, monkeypatch):
     assert "value-mo: 1 trades (1 up, 0 down) +21.43" in text and "ladder-mo: 0 trades" in text and "Open now: 0" in text
 
 
+def test_a_trade_left_open_by_a_stop_is_settled_from_cricbuzz(tmp_path, monkeypatch):
+    """10 Nov: the guard stopped the algo during the WBBL game, and its ladder-mo lay of Adelaide stayed open."""
+    import asyncio
+    import algo_paper.live as live
+    from algo_paper.paper import Ledger
+    monkeypatch.setattr(live, "DATA", tmp_path)
+    ev = "Hobart Hurricanes W v Adelaide Strikers W"
+    ledger = Ledger(tmp_path / "algo.db")
+    ledger.open("ladder-mo", ev, "Adelaide Strikers W", [("lay", 50, 1.42)], "step 1")
+    ledger.state(ev, 123, (1, 23, 1, 24, None), "Hobart Hurricanes W", 0.55, 0.3, 0.29)
+    runner = live.Runner(once=True)
+    done = Match(123, "x", [("Hobart Hurricanes Women", "HBHW"), ("Adelaide Strikers Women", "ADSW")], "Complete",
+                 datetime.min, "T20", status="Adelaide Strikers Women won by 4 wkts")
+
+    async def by_id(match_id):
+        return done if match_id == 123 else None
+
+    runner.cricbuzz.match_by_id = by_id
+    asyncio.run(runner._settle_left())
+    assert runner.ledger.totals_since("2000-01-01")["ladder-mo"] == (1, -21.0) and runner.ledger.open_trades() == 0
+
+
 def test_team_names_and_results():
     assert same_side("Kathmandu Gurkhas", "Kathmandu Gorkhas") and same_side("Hobart Hurricanes W", "Hobart Hurricanes Women")
     assert not same_side("Sydney Sixers W", "Sydney Thunder Women")

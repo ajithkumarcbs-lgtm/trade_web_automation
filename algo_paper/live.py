@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -17,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from tradebot.fancy import Cricbuzz, Match
@@ -33,7 +35,15 @@ EVENT_NAME = "span.max-line-1"
 READ_S = 20
 SCORE_S = 30
 LIST_S = 180
-RELOAD_S = 900
+# Memory, next to the live bot on a 1 GB server. 10 Nov: the algo's Chrome grew past its 220 MB cap during the WBBL game
+# and was killed, and at 15:22 the guard stopped the algo with 59 MB left on the server.
+RELOAD_S = 300  # a match tab is loaded fresh this often: a live page's memory only grows
+RECYCLE_S = 3600  # the whole browser is started again this often,
+RECYCLE_MB = 170  # or when the service uses this much (systemd: MemoryHigh 180M, MemoryMax 220M), at most every
+RECYCLE_GAP_S = 600  # this often
+NO_MARKET_S = 900  # a live match iob7 doesn't list is looked for again after this: each look loads the heavy home page
+ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--renderer-process-limit=2", "--disable-extensions",
+        "--disable-background-networking"]
 LIVE = {"in progress", "innings break", "toss", "delay", "rain", "drink", "strategic timeout"}
 STOP_WORDS = ("BOOKMAKER", "FANCY", "PREMIUM", "LIVE STREAMING", "PLACE BET", "OPEN BETS", "TIED MATCH",
               "COMPLETED MATCH", "TOSS", "WHO WILL")
@@ -55,6 +65,15 @@ def same_side(a: str, b: str) -> bool:
     if not pa or not pb:
         return False
     return pa == pb or pa in pb or pb in pa or name_score(pa, pb) >= 85
+
+
+def _cgroup_mb() -> int | None:
+    """The memory this service uses now (its systemd cgroup, on the server), None elsewhere."""
+    try:
+        path = Path("/proc/self/cgroup").read_text().strip().split("::", 1)[1]
+        return int(Path(f"/sys/fs/cgroup{path}/memory.current").read_text()) // 2 ** 20
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 def _number(token: str) -> float | None:
@@ -180,6 +199,9 @@ class Runner:
         self.cricbuzz = Cricbuzz()
         self.tracked: dict[str, Tracked] = {}
         self.urls: dict[str, str] = {}
+        self.no_market: dict[int, float] = {}  # Cricbuzz match id -> when iob7 was last found not to list it
+        self.pw = self.browser = self.ctx = self.list_page = None
+        self.launched = 0.0
         now_dt = datetime.now()
         # started after today's summary time: today's summary went out already (or the day began before the test)
         self.summary_day = now_dt.date() if (now_dt.hour, now_dt.minute) >= SUMMARY_AT else None
@@ -198,32 +220,80 @@ class Runner:
                   f"Open now: {self.ledger.open_trades()}"]
         return "\n".join(lines)
 
+    async def _launch(self) -> None:
+        try:
+            self.browser = await self.pw.chromium.launch(headless=True, args=ARGS)
+        except Exception:  # no bundled Chromium (this PC): the installed Chrome
+            self.browser = await self.pw.chromium.launch(headless=True, channel="chrome", args=ARGS)
+        self.ctx = await self.browser.new_context(viewport={"width": 1400, "height": 1000})  # fresh: logged out
+        # prices are text: no pictures, video or fonts, to keep memory low next to the live bot
+        await self.ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in
+                             ("image", "media", "font") else route.continue_())
+        self.list_page = await self.ctx.new_page()
+        self.launched = time.time()
+
+    def _recycle_why(self) -> str:
+        """Why the browser should be started again now ('' = it shouldn't)."""
+        if not self.browser.is_connected():
+            return "the browser is gone"
+        age = time.time() - self.launched
+        if age > RECYCLE_S:
+            return "hourly"
+        used = _cgroup_mb()
+        if used is not None and used > RECYCLE_MB and age > RECYCLE_GAP_S:
+            return f"the service uses {used} MB"
+        return ""
+
+    async def _relaunch(self, why: str) -> None:
+        """A new browser, and each tracked match's page opened in it again: the algos and their trades carry on."""
+        log.info("browser started again: %s", why)
+        with contextlib.suppress(Exception):
+            await self.browser.close()
+        await self._launch()
+        for tracked in list(self.tracked.values()):
+            await self._open_tab(tracked)
+
+    async def _open_tab(self, t: Tracked) -> None:
+        try:
+            t.tab = await self.ctx.new_page()
+            await t.tab.goto(self.urls[t.event], wait_until="domcontentloaded", timeout=60000)
+            t.loaded = time.time()
+        except Exception:
+            log.exception("could not open %s again", t.event)
+
+    async def _reopen(self, t: Tracked) -> None:
+        """A page read failed (a hung or crashed tab): a new tab, or a new browser if it is gone."""
+        if not self.browser.is_connected():
+            return await self._relaunch("the browser is gone")
+        with contextlib.suppress(Exception):
+            await t.tab.close()
+        await self._open_tab(t)
+
     async def run(self) -> None:
         async with async_playwright() as pw:
-            args = ["--disable-dev-shm-usage", "--disable-gpu", "--renderer-process-limit=2"]
-            try:
-                browser = await pw.chromium.launch(headless=True, args=args)
-            except Exception:  # no bundled Chromium (this PC): the installed Chrome
-                browser = await pw.chromium.launch(headless=True, channel="chrome", args=args)
-            ctx = await browser.new_context(viewport={"width": 1400, "height": 1000})  # fresh: logged out
-            # prices are text: no pictures, video or fonts, to keep memory low next to the live bot
-            await ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in
-                            ("image", "media", "font") else route.continue_())
-            self.list_page = await ctx.new_page()
-            self.ctx = ctx
+            self.pw = pw
+            await self._launch()
             last_list = 0.0
             while True:
+                why = "" if self.once else self._recycle_why()
+                if why:
+                    await self._relaunch(why)
                 if time.time() - last_list > LIST_S or self.once:
                     try:
                         await self.refresh()
                     except Exception:
                         log.exception("match list")
+                    with contextlib.suppress(Exception):  # the home page's live odds are heavy: not kept open
+                        await self.list_page.goto("about:blank")
                     last_list = time.time()
                     if self.once:
                         await asyncio.sleep(10)  # let the new tabs show their prices
                 for tracked in list(self.tracked.values()):
                     try:
                         await self.read(tracked)
+                    except PlaywrightError:
+                        log.exception("read %s", tracked.event)
+                        await self._reopen(tracked)
                     except Exception:
                         log.exception("read %s", tracked.event)
                 now_dt = datetime.now()
@@ -236,15 +306,34 @@ class Runner:
                 if self.once:
                     break
                 await asyncio.sleep(READ_S)
-            await browser.close()
+            await self.browser.close()
+
+    async def _settle_left(self) -> None:
+        """Open paper trades of a match no longer tracked (10 Nov: the algo was stopped during the WBBL game) are settled
+        from the match's Cricbuzz scorecard once it is over."""
+        for ev in {ev for algo in self.algos for ev in algo.open} - set(self.tracked):
+            try:
+                cb_id = self.ledger.cb_id_of(ev)
+                match = await self.cricbuzz.match_by_id(cb_id) if cb_id else None
+                if match is None:
+                    continue
+                finished, winner = winner_of(match, [half.strip() for half in ev.split(" v ")])
+                if finished:
+                    for algo in self.algos:
+                        algo.settle(ev, winner)
+                    log.info("SETTLED %s, not tracked any more: %s", ev, match.status)
+            except Exception:
+                log.exception("settle %s", ev)
 
     async def refresh(self) -> None:
         matches = await self.cricbuzz.refresh_list()
+        await self._settle_left()
         soon = datetime.now() + timedelta(minutes=20)
         live = [m for m in matches if m.fmt.upper() in ("T20", "T20I")
                 and not re.search(r"T10|sixes|hundred|\b100\b", m.series, re.IGNORECASE)  # Cricbuzz calls T10 'T20'
                 and (m.state.lower() in LIVE or (m.state.lower() == "preview" and m.start <= soon))]
-        wanted = [m for m in live if not any(t.match.match_id == m.match_id for t in self.tracked.values())]
+        wanted = [m for m in live if not any(t.match.match_id == m.match_id for t in self.tracked.values())
+                  and time.time() - self.no_market.get(m.match_id, 0.0) > NO_MARKET_S]
         if not wanted:
             log.info("tracking %d match(es); no new live T20", len(self.tracked))
             return
@@ -255,6 +344,7 @@ class Runner:
                                                                    for half in n.split(" v "))), None)
             if not event:
                 log.info("no iob7 market for %s (%s)", " v ".join(sides), match.series)
+                self.no_market[match.match_id] = time.time()
                 continue
             url = self.urls.get(event) or await self._url_of(event)
             if not url:

@@ -36,6 +36,38 @@ def test_its_tip_and_its_booking_are_read():
     assert (close.action, close.selection) == ("close", "")
 
 
+def test_a_first_name_and_initial_opens_only_a_player_they_fit():
+    """10 Nov: 'WINNER - ADRIAN M' (Mannarino) opened 'Adrian Andreev v Pietri'. Its market was suspended, so no bet went on
+    the wrong player; the tip was missed after 10 minutes of retries."""
+    from tradebot.exchange_bot import _best_index
+    listed = ["Adrian Andreev v Pietri", "Mannarino v Alek Shevchenko"]
+    assert _best_index(listed, "Adrian M", "Adrian") is None  # Andreev isn't M: ESPN's draws or the AI say who
+    assert _best_index(listed, "Adrian A", "Adrian") == 0
+    assert _best_index(["Adrian Andreev v Pietri", "Adrian Mannarino v Alek Shevchenko"], "Adrian M", "Adrian") == 1
+    assert _best_index(["Tallon Griekspoor v Brandon Nakashima"], "Nakashima B", "Nakashima") == 0  # surname, initial
+    assert _best_index(["Tallon Griekspoor v Brandon Nakashima"], "Nakashima C", "Nakashima") is None
+    assert _best_index(["Svrcina v Vi Sachko"], "Vitaliy Sachko v ?", "Vitaliy Sachko") == 0  # no initial: as before
+
+
+def test_the_ais_pick_must_fit_the_tips_initial(store):
+    from tradebot.exchange_bot import ExchangeBot
+    from tradebot.risk import RiskManager
+    settings = make_settings()
+    bot = ExchangeBot(settings, RiskManager(settings, store, "dry_run"))
+    listed = ["Andreev v Pietri", "Mannarino v Alek Shevchenko"]
+    picks = {"Adrian M v ?": "Andreev", "Adrian A v ?": "Andreev"}
+
+    async def resolve(name, event, names):
+        return picks[event]
+
+    bot.resolve_name = resolve
+    assert asyncio.run(bot._found_by_ai(listed, "Adrian M v ?", ["Adrian"])) == {}  # the AI's Andreev isn't M
+    assert asyncio.run(bot._found_by_ai(listed, "Adrian A v ?", ["Adrian"])) == {"Andreev": 0}  # asked again: another player
+    picks["Adrian M v ?"] = "Mannarino"
+    bot._resolved.clear()
+    assert asyncio.run(bot._found_by_ai(listed, "Adrian M v ?", ["Adrian"])) == {"Mannarino": 1}
+
+
 def test_its_other_posts_are_left_to_the_ai():
     for text in ("SINGLE LIMIT SE KHAO", "48 PAISE KHAO", "37 PAISA KHAO", "33 PAISE,....", "NONCUTTING PAAS", "HAAR GYA", "WIN THA",
                  "🔥 TENNIS ALL MATCHES EXCLUSIVE ID AVAILABLE 🔥\n\n🌐 http://www.Lotusbook365.center", "📣Important Audio🔼", "WAIT FOR NEXT", ""):

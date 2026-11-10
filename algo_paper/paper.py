@@ -140,6 +140,11 @@ class Ledger:
     def open_trades(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM trades WHERE closed_at IS NULL").fetchone()[0]
 
+    def cb_id_of(self, event: str) -> int | None:
+        """The Cricbuzz match id last read for this match."""
+        row = self.db.execute("SELECT cb_id FROM states WHERE event = ? ORDER BY ts DESC LIMIT 1", (event,)).fetchone()
+        return row[0] if row else None
+
 
 @dataclass
 class Open:
