@@ -39,7 +39,7 @@ LIST_S = 180
 # and was killed, and at 15:22 the guard stopped the algo with 59 MB left on the server.
 RELOAD_S = 300  # a match tab is loaded fresh this often: a live page's memory only grows
 RECYCLE_S = 3600  # the whole browser is started again this often,
-RECYCLE_MB = 170  # or when the service uses this much (systemd: MemoryHigh 180M, MemoryMax 220M), at most every
+RECYCLE_MB = 190  # or when its anon memory is this much (MemoryMax 220M; 119 MB idle on 10 Nov, + 47 MB file cache), at most every
 RECYCLE_GAP_S = 600  # this often
 NO_MARKET_S = 900  # a live match iob7 doesn't list is looked for again after this: each look loads the heavy home page
 ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--renderer-process-limit=2", "--disable-extensions",
@@ -68,11 +68,13 @@ def same_side(a: str, b: str) -> bool:
 
 
 def _cgroup_mb() -> int | None:
-    """The memory this service uses now (its systemd cgroup, on the server), None elsewhere."""
+    """The anon memory this service uses now (its systemd cgroup, on the server), None elsewhere. File cache is left out:
+    the kernel takes it back by itself, and it made an idle algo look like 178 MB."""
     try:
         path = Path("/proc/self/cgroup").read_text().strip().split("::", 1)[1]
-        return int(Path(f"/sys/fs/cgroup{path}/memory.current").read_text()) // 2 ** 20
-    except (OSError, IndexError, ValueError):
+        stat = Path(f"/sys/fs/cgroup{path}/memory.stat").read_text()
+        return int(re.search(r"^anon (\d+)$", stat, re.MULTILINE)[1]) // 2 ** 20
+    except (OSError, IndexError, ValueError, TypeError):
         return None
 
 
