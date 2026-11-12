@@ -37,6 +37,10 @@ RESOLVE_AGAIN = timedelta(minutes=3)  # each ask can be 3 models' calls: kept ra
 RESOLVE_BACKOFF = 7  # and doubled each time it stays unanswered (up to 6 h): an order can wait for days on a match gone
 RESOLVE_LIST_MAX = 200  # matches shown to the AI
 FANCY_OPEN_TRIES = 4  # looks at a fancy row 2 s apart while it says BALL RUNNING
+# The site's tab is replaced by a new one this often, between actions (the login stays in the browser profile): Playwright's
+# driver grows with every load on one tab. 10-12 Nov it reached 262 MB (most of it in swap) 35 hours after a restart, and on
+# 11 Nov page reads timed out 100+ times an hour: #130 Kasnikowski went 3 hours without a price, so no auto-bookset.
+PAGE_FRESH = timedelta(hours=2)
 # A lay with a worst price (an SK-method step) that the site refused because the price moved asks this many ticks above the
 # price on offer: 10 Nov, Hobart's lay at 1.24 -> 1.25 and 1.22 -> 1.23 between reading and clicking, 'Unmatch Bet Not Allow'.
 CUSHION_TICKS = 2
@@ -109,6 +113,7 @@ class ExchangeBot:
         self._pw = None
         self._ctx = None
         self._page: Page | None = None
+        self._page_since = datetime.now()  # when the site's tab was opened (PAGE_FRESH)
         self._lock = asyncio.Lock()  # one browser action at a time: tips, auto-bookset checks, keep-alive
         self._row_name = ""  # site's name of the team/player last chosen on the match page
         self._row: Locator | None = None  # and its row
@@ -131,7 +136,9 @@ class ExchangeBot:
             try:
                 yield
             finally:
-                if self._s.headless:
+                if datetime.now() - self._page_since > PAGE_FRESH:
+                    await self._fresh_page()
+                elif self._s.headless:
                     await self._park()
 
     async def _park(self) -> None:
@@ -140,10 +147,22 @@ class ExchangeBot:
         except Exception:
             log.warning("  could not leave the site page idle", exc_info=True)
 
+    async def _fresh_page(self) -> None:
+        """A new, blank tab for the next action, and the old one closed (PAGE_FRESH). Every action opens the site's list
+        from the start anyway, and the login is kept by the browser profile."""
+        try:
+            old, self._page = self._page, await self._ctx.new_page()
+            self._page_since = datetime.now()
+            await old.close()
+            log.info("  site tab replaced by a new one (every %s, to keep memory down)", PAGE_FRESH)
+        except Exception:
+            log.warning("  could not replace the site tab", exc_info=True)
+
     async def start(self) -> None:
         self._pw = await async_playwright().start()
         self._ctx = await launch_browser(self._pw, self._s, self._s.headless)
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
+        self._page_since = datetime.now()
         for attempt in (1, 2):  # the site is sometimes slow to show its match list
             try:
                 await self._open_list()
@@ -322,6 +341,9 @@ class ExchangeBot:
             cell, price = await self._odds_box_when_open(name, sig.side, need_price=not (sig.side == "back" and limit))
             runner = self._row_name
             log.info("  live %s price for %s: %s (tip %s)", sig.side, runner, price, sig.odds or sig.when_odds)
+            if above := _above_step(sig, price):  # 11 Nov: the 1.50 step was tried at 1.53 and 1.54 (20% tolerance)
+                result = BetResult("retry", above, price)
+                break
             if sig.side == "back" and limit and (price is None or price >= limit):
                 # e.g. tip "back X 15": lay the other runner at its lay price (1.07 = back 15.3) right now
                 result = await self._place_back_as_lay(sig, price)
@@ -338,6 +360,8 @@ class ExchangeBot:
                 decision = self._risk.price_check(sig, slip_price)
                 if not decision.ok:
                     raise BetAborted("skipped", f"price moved in the slip: {decision.reason}", slip_price)
+                if above := _above_step(sig, slip_price):
+                    raise BetAborted("skipped", f"{above} (in the slip)", slip_price)
                 price = slip_price
             if attempt and price:
                 decision, price = await self._cushion(sig, slip, decision, price)
@@ -1105,6 +1129,14 @@ def _price_moved(reason: str) -> bool:
     delay ('Cannot place bet. Odds is not correct.'). Worth a second try at the new price straight away."""
     text = reason.lower()
     return sel.PRICE_MOVED_ERROR in text or "odds is not correct" in text or "odds not correct" in text
+
+
+def _above_step(sig: BetSignal, price: float | None) -> str:
+    """Why an SK-method lay can't go in at this price: above its step's top, whatever the channel's tolerance ('' = it
+    can). A refusal that passes: the method looks again in seconds."""
+    if sig.side == "lay" and sig.worst_odds and price and price > sig.worst_odds + 1e-9:
+        return f"price moved: lay {price:g} is above the step's top {sig.worst_odds:g}"
+    return ""
 
 
 def ticks_up(price: float, ticks: int) -> float:

@@ -3,8 +3,10 @@
 # room again, and at least WAIT_MIN after that stop, the guard starts it again, so the week's test goes on (10 Nov it stayed
 # stopped from 15:22). Only a stop the guard made is undone: one by hand stays. Logs to ~/algo/guard.log and tells you through
 # the algo's own Telegram bot.
-STOP_BELOW_MB=75
-START_ABOVE_MB=250
+# 12 Nov: raised from 75 / 250. On 11 Nov the live bot's page reads timed out 100+ times an hour with the algo running and
+# the server swapping: the live bot comes first.
+STOP_BELOW_MB=130
+START_ABOVE_MB=280
 WAIT_MIN=30
 STATE=/home/ubuntu/algo/guard.stopped  # the time of the guard's last stop, until it starts the algo again
 avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
