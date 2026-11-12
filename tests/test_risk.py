@@ -164,3 +164,22 @@ def test_optional_daily_caps(store):
     store.open_position(signal(), "dry_run", 2.9, 1000)
     r = risk(store, max_liability_per_bet=1500)
     assert not r.price_check(signal(side="lay", odds=3.0), 3.0).ok  # liability 2000
+
+
+def test_a_live_bookset_never_closes_another_channels_trade(store):
+    """12 Nov: SS's "Now booksert" (its own Brisbane trade booked at 12:16) cashed out MY Tips' Brisbane lay of 12:48."""
+    import time
+    live = RiskManager(make_settings(), store, "live")
+    heat = dict(selection="Brisbane Heat W", event="Melbourne Stars W v Brisbane Heat W", sport="cricket")
+    store.open_position(signal(channel="SS sports", **heat), "live", 3.04, 125)
+    store.set_closed(store.find_position("Brisbane Heat W", "live").id)
+    time.sleep(1.1)
+    store.open_position(signal(channel="MY Tips", side="lay", **heat), "live", 1.34, 50)
+    d = live.precheck(signal(action="close", odds=None, channel="SS sports", **heat))
+    assert not d.ok and "already booked" in d.reason and "MY Tips's Brisbane Heat W trade left alone" in d.reason
+    d = live.precheck(signal(action="close", odds=None, channel="Raftaar", **heat))
+    assert not d.ok and d.reason.startswith("MY Tips's Brisbane Heat W trade left alone")
+    d = live.precheck(signal(action="close", odds=None, channel="MY Tips", **heat))
+    assert d.ok and d.position.channel == "MY Tips"  # its own
+    d = live.precheck(signal(action="close", odds=None, channel="manual", **heat))
+    assert d.ok and d.position.channel == "MY Tips"  # your command reaches every trade

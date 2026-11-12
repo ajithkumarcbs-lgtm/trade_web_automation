@@ -762,3 +762,22 @@ def test_a_lay_tried_again_asks_a_tick_or_two_more_up_to_its_step(store):
     assert cushion(lay, 1.5)[:2] == (1.5, None)  # at the step's top already
     assert cushion(lay.model_copy(update={"worst_odds": None}), 1.25)[:2] == (1.25, None)  # a tipster's lay: as offered
     assert cushion(signal(odds=2.9), 2.9)[:2] == (2.9, None)  # a back: as offered
+
+
+def test_a_method_whose_trade_is_settled_stops_looking(store):
+    """11 Nov: MY Tips' Perth lay was settled at the match's end, and the method read the suspended market for 8 more hours."""
+    pipe, site, notifier = sk(store)
+    tip(pipe, MATCH_WIN)
+    look(pipe, site, 1.45)
+    store.set_closed(store.find_position("Netherlands", "dry_run").id, how="finished")
+    look(pipe, site, None)  # suspended: no price
+    assert store.active_ladders("dry_run") == [] and "its trade is closed" in notifier.sent[-1]
+
+
+def test_a_suspended_id_is_alerted_once(store):
+    pipe, site, notifier = sk(store)
+    reason = "will retry, every 10s for up to 5 min: Your ID is suspended. Please contact Upperline."
+    for _ in range(3):
+        asyncio.run(pipe._warn_if_suspended(reason))
+    asyncio.run(pipe._warn_if_suspended("market suspended"))
+    assert sum("SUSPENDED" in text for text in notifier.sent) == 1

@@ -188,8 +188,26 @@ class RiskManager:
             return round(sig.amount, 2)
         return round((1.0 if sig.units is None else sig.units) * self.cfg(sig).unit_stake, 2)
 
-    def _open_position(self, sig: BetSignal) -> Position | Decision:
+    def _find_own(self, sig: BetSignal) -> tuple[Position | None, str]:
+        """The trade a channel's exit or bookset acts on, and why another channel's was left alone ('' = none was).
+        Live, a name finds any channel's trade; a channel's own comes first, and another channel's is never touched:
+        12 Nov, SS's "Now booksert" (its Brisbane trade booked at 12:16) cashed out MY Tips' Brisbane lay of 12:48.
+        Your own commands (channel '' or manual) still reach every trade."""
         position = self._find(sig, sig.channel)
+        if self._mode != "live" or sig.channel in ("", "manual") or position is None or position.channel == sig.channel:
+            return position, ""
+        own = self._store.find_position(sig.selection, self._mode, sig.channel, strict=True)
+        if own is None and sig.aka:
+            own = self._store.find_position(sig.aka, self._mode, sig.channel, strict=True)
+        if own:
+            return own, ""
+        return None, (f"{position.channel}'s {position.selection} trade left alone: {sig.channel} has no open trade "
+                      f"on it")
+
+    def _open_position(self, sig: BetSignal) -> Position | Decision:
+        position, other = self._find_own(sig)
+        if other:
+            return Decision(False, other)
         if position is None:
             return Decision(False, f"no open trade on {sig.selection}")
         if position.price is None:
@@ -219,7 +237,12 @@ class RiskManager:
         """Book set / loss cut now, through the site's Cashout. Also works on a trade placed by hand: the
         site only offers Cashout on a match where you hold a position. A bookset naming no team acts on the
         channel's latest trade."""
-        position = self._find(sig, sig.channel)
+        position, other = self._find_own(sig)
+        if other:
+            closed = self._store.recently_closed(sig.selection, self._mode, sig.channel)
+            if closed:
+                return Decision(False, f"already booked: {closed[0]} trade closed at {closed[1][11:16]}; {other}")
+            return Decision(False, other)
         if position and position.close_pending_since:  # "Bookset guys" again while it is being booked
             return Decision(False, f"already booking {position.selection} (retrying since "
                                    f"{position.close_pending_since[11:16]})")

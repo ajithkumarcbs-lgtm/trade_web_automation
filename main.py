@@ -213,6 +213,7 @@ LADDER_POLL = timedelta(seconds=20)  # how often an SK-method match's price is r
 # Hobart was in the first step for 4 minutes of the last over and 6 tries 20-35 s apart were all refused (Adelaide won).
 LADDER_FAST_POLL = timedelta(seconds=3)
 LADDER_FAST_FOR = timedelta(minutes=2)
+SUSPENDED_ALERT_EVERY = timedelta(minutes=30)  # the site refusing because the account is suspended: alerted this often
 LADDER_LONGEST = timedelta(hours=12)  # a match still on after this isn't watched: nor are its trades (POSITION_WINDOW)
 LADDER_NOT_LISTED = timedelta(minutes=40)  # a tipped match the site still doesn't list this long after its start: missed
 LADDER_GONE_READS = 15  # reads in a row (~5 min) without the match on the site, after it was there: it is over
@@ -334,6 +335,7 @@ class Pipeline:
         self._ladder_gone: dict[int, int] = {}  # SK-method tip -> reads in a row that didn't find its match on the site
         self._ladder_blocked: dict[int, str] = {}  # SK-method tip -> why its entry is blocked, told once
         self._ladder_hot: dict[int, datetime] = {}  # SK-method tip -> looked at every LADDER_FAST_POLL until then
+        self._suspended_alert = datetime.min  # last "your ID is suspended" alert
         self._missed_by_limit = 0  # messages not read since the last "AI limit" alert
         self._last_limit_alert = datetime.min
         # What your commands set stays over a restart.
@@ -1043,6 +1045,7 @@ class Pipeline:
                 if result.status == "retry":
                     self._store.update_pending(pending_id, result.reason)
                     log.info("  still trying %s %s (%.0fs): %s", sig.action, sig.selection, waited, result.reason)
+                    await self._warn_if_suspended(result.reason)
                     continue
                 self._store.remove_pending(pending_id)
                 result.reason = f"after {waited:.0f}s of {'waiting' if sig.when_odds else 'retrying'}: {result.reason}"
@@ -1097,6 +1100,7 @@ class Pipeline:
                 result = await self._bot.place(sig, current, require_green=green)
                 if result.status == "retry":
                     log.info("  still booking %s (%.0fs): %s", current.selection, waited, result.reason)
+                    await self._warn_if_suspended(result.reason)
                     continue
                 if result.status not in ("placed", "unconfirmed"):
                     self._store.clear_close_pending(current.id)
@@ -1270,6 +1274,10 @@ class Pipeline:
             return  # a tip before its match: the site isn't opened until then
         if now - start > LADDER_LONGEST:
             return await self._end_ladder(ladder, "no longer watched, 12 hours after its start")
+        if ladder.last_step >= 0 and ladder.other and \
+                self._store.find_position(ladder.other, self._mode, ladder.channel, strict=True) is None:
+            # settled or booked meanwhile: no more looks (11 Nov one went on reading a suspended market for 8 hours)
+            return await self._end_ladder(ladder, "its trade is closed")
         async with self._trade_lock(TradeLock.OTHER):  # a price check: tipsters' instructions go first
             active = {now_on.id: now_on for now_on in self._store.active_ladders(self._mode)}
             if ladder.id not in active:
@@ -2182,6 +2190,7 @@ class Pipeline:
         self._store.log_bet(
             message_id, sig, self._mode, result.status, result.reason, result.price, result.stake, result.liability
         )
+        await self._warn_if_suspended(result.reason)
         if sig.action == "entry" and sig.market != "fancy" and not result.reason.startswith("TOP-UP"):
             # under the site's own names when it gave them, so booksets and price checks find the trade later
             names = {k: v for k, v in (("selection", result.name), ("event", result.event)) if v}
@@ -2208,6 +2217,20 @@ class Pipeline:
                           result.reason, _clock()),
                 result.screenshot,
             )
+
+
+    async def _warn_if_suspended(self, reason: str) -> None:
+        """The site saying the account itself is suspended: one urgent alert per SUSPENDED_ALERT_EVERY. 11 Nov 14:47-15:00
+        it refused 58 tries with "Your ID is suspended. Please contact Upperline." and only the logs showed it."""
+        if not self._notifier or not re.search(r"\bid is suspended|contact upperline", reason, re.IGNORECASE):
+            return
+        now = datetime.now()
+        if now - self._suspended_alert < SUSPENDED_ALERT_EVERY:
+            return
+        self._suspended_alert = now
+        await self._notifier.send("⛔ *iob7 says your ID is SUSPENDED* (\"Your ID is suspended. Please contact Upperline.\"). "
+                                  "No bet can go in or be booked until it is lifted: ask whoever gave you the ID, and check "
+                                  "open bets on the site by hand.")
 
 
 async def run(signals_only: bool) -> None:
