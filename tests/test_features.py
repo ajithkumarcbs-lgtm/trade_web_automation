@@ -320,4 +320,5 @@ def test_a_suspended_tennis_market_is_retried_longer(store):
     pipe = Pipeline(settings, "dry_run", None, RiskManager(settings, store, "dry_run"), store)
     assert pipe._retry_minutes(signal(), "market suspended") == 10
     assert pipe._retry_minutes(signal(), "match not found on site: Tallon v ?") == 5
-    assert pipe._retry_minutes(signal(sport="cricket"), "market suspended") == 5
+    # a cricket market suspended for a review / rain / the innings break: 12 min (SS's 15 Nov India entry was missed at 5)
+    assert pipe._retry_minutes(signal(sport="cricket"), "market suspended") == 12

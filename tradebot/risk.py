@@ -12,6 +12,8 @@ from .store import Position, Store, period_start
 # The bot bets on Match Odds (back/lay a team or player). Bookmaker and Fancy need other screens.
 SUPPORTED_MARKETS = ("match_odds",)
 CONDITIONAL_TOLERANCE = 0.02  # "3 odds pona edunga": goes in once the back price is within 2% of 3
+LONG_SHOT_ODDS = 10.0  # a back tip at these odds or more ...
+LONG_SHOT_TOLERANCE = 0.25  # ... takes a price down to 25% below the tip (small stakes; coarse lay ticks above 10)
 STOP_PERIODS = (("day", "daily_stop_units"), ("week", "weekly_stop_units"), ("month", "monthly_stop_units"))
 OTHER_RUNNER_APART = 1.5  # a tip this many times away from the runner's price isn't that price moving ...
 OTHER_RUNNER_FIT = 0.12  # ... and the other runner's if 1/tip + 1/price is this close to 1
@@ -310,6 +312,10 @@ class RiskManager:
         tip = to_decimal(sig.market, sig.odds)
         if sig.side == "back":
             lowest = tip - s.odds_tolerance_abs if s.odds_tolerance_abs else tip * (1 - s.odds_tolerance)
+            if tip >= LONG_SHOT_ODDS:
+                # a long shot moves in big steps, and above 10 it goes in as a lay of the opponent, whose ticks
+                # (1.04 / 1.05 / 1.06 = back 26 / 21 / 17.7) can't hit the tip within 10%: SS's '20 odds' calls
+                lowest = min(lowest, tip * (1 - LONG_SHOT_TOLERANCE))
             if live < lowest - 1e-9:
                 return f"SLIPPAGE_REJECTED: back odds dropped to {live:g} (tip {tip:g}, lowest allowed {lowest:.2f})"
         if sig.side == "lay":

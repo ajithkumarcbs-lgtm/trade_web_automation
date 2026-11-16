@@ -54,6 +54,15 @@ MIN_LIMIT = 10  # /limit: the site's Min Bet, on every market seen so far
 MAX_LIMIT = 10_000  # a slip of the finger must not make 1 limit a lakh
 BOOKSET_RETRY_SECONDS = 10  # how often a refused bookset / loss cut is tried again
 TENNIS_SUSPENDED_MINUTES = 10  # a tennis entry whose market is suspended is retried this long (not ENTRY_RETRY_MINUTES)
+# a cricket entry whose market is suspended (a review, rain, the innings break) is retried this long: SS's 'India 3 odds'
+# on 15 Nov was missed after 5 min of 'market suspended'. Every try still checks the price against the tip.
+CRICKET_SUSPENDED_MINUTES = 12
+# a close naming no team this soon after the channel's last close is that close again: SS 15 Nov posted 'Ind match
+# losscut', 'Bookset fav 1.38 ind', then 'Perfect entry perfect bookset', which booked its newer Australia trade
+CLOSE_REPEAT = timedelta(minutes=10)
+# 'Back mlr', then '10 odds' (SS 15 Nov): a bare price after an entry is that entry's price, not a 10-unit stake.
+# '10 odds' / '4.1 odds' / '3.7' are prices; a bare '2' or '0.5' stays a stake.
+PRICE_ONLY = re.compile(r"^\s*(?:(\d{1,3}(?:\.\d{1,2})?)\s*odds?|(\d{1,2}\.\d{1,2}))\s*$", re.IGNORECASE)
 MARKET_SHUT_MINUTES = 30  # the site's Max Bet is 0 until it opens a market: Panther's 2 Nov tip came 23 min before the start
 HELD_ENTRY_MINUTES = 40  # an entry held for its match is tried this long from its time (10 min before to 30 after the start)
 # A waiting entry allowed longer than this can wait for days (CricStatz's Test orders): its price is read SLOW_WAIT_EVERY,
@@ -70,6 +79,9 @@ AGAIN = re.compile(r"\bagain\b", re.IGNORECASE)  # "Again bookset": the trade en
 AI_WORDS = re.compile(
     r"\b(back|lay|khao+|lagao|lagaa|win|winner|entry|entries|entr|limit|limits|unit|units|odds|paise|\d+\s*p|"
     r"book\W*set|bookset|cash\W*out|cashout|loss\W*cut|losscut|exit|skip|even|fav|favourite|favorite|take|taken|try|"
+    # SS's typos, which the filter dropped before the AI saw them: 'Losscit 🔥' (14 Nov), 'Booksey' (12 Nov),
+    # 'Bookse' (15 Nov), 'Booksert', 'Loss ut now' (11 Nov)
+    r"loss\W*c[iu]t|los\W*cut|loss\W*ut|book\W*se[ty]?|booksert|"
     r"add|extra|half|double|single|green|small|stake|rs|cancel|plus|khelo|karo|kro|now)\b|\d\.\d|₹",
     re.IGNORECASE)
 # A voice note a channel acts on goes to the AI only with one of these (about 2 in 5 of SS's), in English or Tamil letters
@@ -345,6 +357,7 @@ class Pipeline:
         self._asked: dict[int, Asked] = {}
         self._ask_number = 0
         self._held: dict[str, Held] = {}  # channel -> entry waiting for its stake message
+        self._last_close: dict[str, datetime] = {}  # channel -> when its last close instruction came (CLOSE_REPEAT)
         self._last_entry: dict[str, tuple[BetSignal, str]] = {}  # channel -> its latest entry and what became of it
         self._entries: dict[str, deque[tuple[BetSignal, str]]] = {}  # channel -> its recent entries, the same way
 
@@ -520,6 +533,16 @@ class Pipeline:
             if sig.action == "close" and not msg.voice and not_yet(msg.text):
                 log.info("  not a close yet: %r", msg.text[:60])
                 continue
+            if sig.action == "close":
+                unnamed = not sig.selection.strip(" ?") or (
+                    not _mentions(msg.text, sig.selection, profile.aliases)
+                    and not _mentions(msg.reply_to, sig.selection, profile.aliases))
+                last = self._last_close.get(channel.name)
+                if unnamed and last is not None and timedelta(0) <= msg.date - last <= CLOSE_REPEAT:
+                    log.info("  close naming no team %.0fs after %s's last close: the same close again (%r)",
+                             (msg.date - last).total_seconds(), channel.name, msg.text[:60])
+                    continue
+                self._last_close[channel.name] = msg.date
             if (sig.action == "close" and not _mentions(msg.text, sig.selection, profile.aliases)
                     and not _mentions(msg.reply_to, sig.selection, profile.aliases)):
                 again = self._again_entry(channel) if AGAIN.search(msg.text) else None
@@ -580,7 +603,11 @@ class Pipeline:
                 return
             sig = sig.model_copy(update={"selection": held.selection, "event": held.event, "aka": "", "side": held.side})
         if sig.action == "stake":
-            await self._stake_message(sig, channel, message_id)
+            price = PRICE_ONLY.match(text or "")
+            if price and float(price.group(1) or price.group(2)) >= 1.01:
+                await self._price_message(float(price.group(1) or price.group(2)), sig, channel, message_id)
+                return
+            await self._stake_message(sig, channel, message_id, text)
             return
         if sig.action == "entry" and sig.market == "fancy" and channel.profile.fancy_paper:
             await self._fancy_entry(sig, channel, message_id)
@@ -657,6 +684,9 @@ class Pipeline:
         sig = sig.model_copy(update=names)
         if profile.rupees_per_unit and sig.amount and not sig.green_pct:  # the tipster's rupees, not ours
             sig = sig.model_copy(update={"units": round(sig.amount / profile.rupees_per_unit, 2), "amount": None})
+        if (sig.action == "add" and sig.units is None and sig.amount is None and SMALL_STAKE.search(text)
+                and profile.small_units > 0):
+            sig = sig.model_copy(update={"units": profile.small_units})  # an add 'try small amount', not a whole unit
         if sig.action != "entry":
             return sig, ""
         most = self._risk.cfg(channel.name).max_units_per_bet
@@ -728,12 +758,25 @@ class Pipeline:
             del self._held[channel.name]
             await self._go(held.sig, channel, held.how, held.message_id)
 
-    async def _stake_message(self, sig: BetSignal, channel: Channel, message_id: int | None) -> None:
+    async def _price_message(self, price: float, sig: BetSignal, channel: Channel, message_id: int | None) -> None:
+        """'Back mlr', then '10 odds' (SS 15 Nov, read as a 10-unit stake and refused by the liability cap): the price
+        of the entry held for its stake message, which keeps waiting for its stake ('Try small amount')."""
+        held = self._held.get(channel.name)
+        if held is not None:
+            held.sig = held.sig.model_copy(update={"odds": price})
+            log.info("  %s: price %g for the held entry on %s", channel.name, price, held.sig.selection)
+            return
+        reason = f"a price ({price:g} odds), not a stake: no entry of {channel.name} is waiting for one"
+        await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
+
+    async def _stake_message(self, sig: BetSignal, channel: Channel, message_id: int | None, text: str = "") -> None:
         held = self._held.pop(channel.name, None)
         if held:
             if held.task:
                 held.task.cancel()
             stake = {"amount": sig.amount, "units": None} if sig.amount else ({"units": sig.units} if sig.units else {})
+            if not stake and SMALL_STAKE.search(text) and channel.profile.small_units > 0:
+                stake = {"units": channel.profile.small_units}  # 'Back mlr', '10 odds', then 'Try small amount'
             entry = held.sig.model_copy(update={**stake, **({"green_pct": sig.green_pct} if sig.green_pct else {})})
             entry, problem = self._prepare(entry, "", channel)
             if problem:
@@ -867,8 +910,11 @@ class Pipeline:
             log.info("  %g is the other runner's price (%s is %g): adding to the trade", sig.odds, pos.selection, price)
             odds, extra = price, extra * (sig.odds - 1)
         if pos.side == "back" and odds and self._s.max_back_odds and odds >= self._s.max_back_odds:
-            return await skip(f"can't add to the {pos.selection} back at {odds:g}: backs from "
-                              f"{self._s.max_back_odds:g} are placed as a lay of the opponent")
+            # SS 16 Nov '20 odds back mls try small amount' on its open Stars back: the site takes no back above
+            # MAX_BACK_ODDS, so the top-up goes in as a lay of the opponent (exchange_bot._place_back_as_lay), the
+            # same win and loss as that back, and is added to the trade as the back it stands for.
+            log.info("  add to %s at %g: above MAX_BACK_ODDS %g, placed as a lay of the opponent", pos.selection,
+                     odds, self._s.max_back_odds)
         why = self._confirm_reason(sig.model_copy(update={"action": "entry"}), channel, how)
         if why and (self._mode == "live" or self._s.confirm_in_dry_run):
             return await skip(f"add not made: {why}")
@@ -1074,6 +1120,8 @@ class Pipeline:
             return max(self._s.entry_retry_min, MARKET_SHUT_MINUTES)
         if sig.sport == "tennis" and "suspended" in reason.lower():
             return max(self._s.entry_retry_min, TENNIS_SUSPENDED_MINUTES)
+        if "suspended" in reason.lower():
+            return max(self._s.entry_retry_min, CRICKET_SUSPENDED_MINUTES)
         return self._s.entry_retry_min
 
     async def _retry_pending_closes(self) -> None:
