@@ -404,6 +404,8 @@ class Pipeline:
         if channel.profile.watch_links:
             await self._report_links(msg, channel)
         if not channel.profile.trade or (self._mode == "live" and channel.profile.paper_only):
+            if channel.profile.shadow and self._mode == "live":
+                await self._shadow(msg, channel, context)
             return
 
         age = (datetime.now(timezone.utc) - msg.date).total_seconds()
@@ -441,6 +443,30 @@ class Pipeline:
 
         for sig in signals:
             await self._act(sig, msg.text, channel, how, message_id)
+
+    async def _shadow(self, msg: IncomingMessage, channel: Channel, context: list[str]) -> None:
+        """A channel followed on paper while the bot is live: every post is logged with the AI's reading, and each
+        entry / add / close it names gets a row with the site's price at that moment (mode 'shadow'), so following it
+        can be judged later on real prices and times. Nothing is ever placed, and no trade of another channel is
+        touched."""
+        signals, how, parsed = await self._read(msg, channel, context)
+        if parsed is None:
+            parsed = ParsedMessage(signals=[], summary="not read by the AI (shadow)")
+        message_id = self._store.log_message(msg.id, msg.text, msg.image is not None, parsed, channel.name)
+        log.info("msg %s [%s] shadow: %s (%d signal(s), %s)", msg.id, channel.name, parsed.summary, len(signals), how)
+        for sig in signals:
+            sig, _ = self._prepare(sig, msg.text, channel)
+            price = None
+            if (sig.action in ("entry", "add", "close", "exit") and sig.market == "match_odds"
+                    and sig.selection.strip(" ?") and self._bot is not None):
+                try:
+                    async with self._trade_lock(TradeLock.OTHER):
+                        price = await self._bot.quote(sig.model_copy(update={"side": sig.side or "back"}))
+                except Exception as exc:  # the match may not be listed yet (a pick the night before)
+                    log.info("  shadow: no site price for %s: %s", sig.selection, exc)
+            reason = (f"shadow ({how}): followed on paper, nothing placed; site price at the post: "
+                      f"{price:g}" if price else f"shadow ({how}): followed on paper, nothing placed; no site price")
+            self._store.log_bet(message_id, sig, "shadow", "shadow", reason, price)
 
     async def _read(self, msg: IncomingMessage, channel: Channel,
                     context: list[str]) -> tuple[list[BetSignal], str, ParsedMessage | None]:

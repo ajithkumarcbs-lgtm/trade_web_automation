@@ -61,6 +61,9 @@ class Profile:
     jackpot_days_only: bool = False  # live: entries only on jackpot days; paper: every day, the days reported apart
     pasted: bool = False  # tips pasted by hand from WhatsApp: stamped lines that aren't new are history, never traded
     paper_only: bool = False  # a live run ignores this channel: DRY_RUN=false must not put every test channel on real money
+    # with paper_only, a live run still reads the channel, logs each post with the AI's reading and records the site's
+    # price at that moment for every entry / close it names, placing nothing (IYYAPPA's group, followed from 17 Nov)
+    shadow: bool = False
     confirm: dict = field(default_factory=dict)  # ask you first: always, below_confidence, above_units, disagree
     watch_links: bool = False  # alert you when the channel posts a Telegram group link
 
