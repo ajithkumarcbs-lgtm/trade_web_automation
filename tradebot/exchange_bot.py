@@ -944,17 +944,24 @@ class ExchangeBot:
         await self._clear_toasts()
         await place.click()
         log.info("  Placebet clicked (odds %s, stake %g); waiting for the site", shown_odds, stake)
-        status, reason = await _wait_for_outcome(self._page)
-        status, reason = await self._confirm_by_balance(status, reason, before)
-        if status != "failed":
-            listed = await self._in_open_bets(self._row_name or sig.selection, stake, shown_odds)
-            if listed:
-                if status == "unconfirmed":
-                    status, reason = "placed", f"no message shown, but listed in Open Bets ({listed})"
-                else:
-                    reason = f"{reason}; listed in Open Bets ({listed})"
-            elif status == "placed":
-                reason = f"{reason}; not yet listed in Open Bets"
+        try:
+            status, reason = await _wait_for_outcome(self._page)
+            status, reason = await self._confirm_by_balance(status, reason, before)
+            if status != "failed":
+                listed = await self._in_open_bets(self._row_name or sig.selection, stake, shown_odds)
+                if listed:
+                    if status == "unconfirmed":
+                        status, reason = "placed", f"no message shown, but listed in Open Bets ({listed})"
+                    else:
+                        reason = f"{reason}; listed in Open Bets ({listed})"
+                elif status == "placed":
+                    reason = f"{reason}; not yet listed in Open Bets"
+        except PlaywrightTimeout as exc:
+            # The bet may well be in: never tried again blindly. 21 Nov 10:20 (SS, Perth) the page hung after the click,
+            # the timeout was retried as an entry, and a second bet went in at 4.2 on top of the first at 3.65.
+            status = "unconfirmed"
+            reason = (f"Placebet was clicked, then the page timed out ({str(exc).splitlines()[0]}): counted as placed "
+                      f"and NOT tried again; check Open Bets on the site")
         if capped:
             reason = f"{reason}; {capped}"
         log.info("  result: %s, %s", status.upper(), reason)

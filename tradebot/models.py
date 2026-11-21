@@ -81,17 +81,24 @@ class BetSignal(AISignal):
     # An SK-method lay: the highest lay price its step allows (1.50 for the first). A try the site refused because the price
     # moved asks a tick or two above the price on offer, up to this, so a small move in the bet delay still matches.
     worst_odds: float | None = None
+    # A close that keeps part of the trade (SS's voice '0.5 limit exit, 0.5 hold'): the site's Cashout books the whole
+    # trade, then this share of it goes back in at once, sized to pay as that share of the old trade would.
+    keep_share: float | None = None
 
     def key(self) -> str:
         """Normalised identity used to spot the same tip posted twice."""
         parts = [self.action, self.sport, self.event, self.market, self.selection, self.side,
                  str(self.line or ""), str(self.odds or "")]
+        if self.keep_share:  # a part exit is no duplicate of the bookset of the part kept
+            parts.append(f"keep {self.keep_share:g}")
         return "|".join(re.sub(r"[^a-z0-9.]+", " ", p.lower()).strip() for p in parts)
 
     def describe(self) -> str:
         source = f"[{self.channel}] " if self.channel else ""
         if self.action == "close":
             kind = "LOSS CUT" if self.loss_cut else "BOOKSET"
+            if self.keep_share:
+                kind = f"PART EXIT, {self.keep_share:.0%} kept"
             return f"{source}CLOSE ({kind}) {self.selection} [{self.market}] {self.event}"
         if self.action == "cancel":
             return f"{source}CANCEL waiting bets on {self.selection}"

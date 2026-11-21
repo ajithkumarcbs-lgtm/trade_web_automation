@@ -105,7 +105,8 @@ def test_a_long_shot_takes_a_price_up_to_25_percent_below_the_tip(store):
     assert not risk.price_check(signal(odds=5.0, units=0.5), 4.4).ok  # below 10 the channel's 10% stays
 
 
-def test_a_suspended_cricket_market_is_retried_12_minutes(store):
+def test_a_suspended_cricket_market_is_retried_20_minutes(store):
+    """15 Nov 'India 3 odds' missed after 5 min of 'market suspended', 17 Nov 'Ads back 3.8' after 12."""
     pipe, _, _ = make(store, Profile("ss"), {})
-    assert pipe._retry_minutes(signal(**IND), "market suspended") == 12
+    assert pipe._retry_minutes(signal(**IND), "market suspended") == 20
     assert pipe._retry_minutes(signal(**IND), "SLIPPAGE_REJECTED: back odds dropped") == 5

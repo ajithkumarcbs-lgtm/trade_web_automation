@@ -52,14 +52,25 @@ log = logging.getLogger("tradebot")
 
 MIN_LIMIT = 10  # /limit: the site's Min Bet, on every market seen so far
 MAX_LIMIT = 10_000  # a slip of the finger must not make 1 limit a lakh
-BOOKSET_RETRY_SECONDS = 10  # how often a refused bookset / loss cut is tried again
+BOOKSET_RETRY_SECONDS = 10  # how often a waiting entry / limit exit is tried again
+# A refused bookset / loss cut is tried again this often: SS's 19 Nov loss cut on Thunder was refused 4 times ('Odds is
+# not correct', the price moving in the bet delay) and took 1.5 min at one try per 10 s.
+CLOSE_RETRY_SECONDS = 4
+KEEP_TRIES = 3  # a part exit's kept share is tried this many times straight after the booking (price moved, etc.)
 TENNIS_SUSPENDED_MINUTES = 10  # a tennis entry whose market is suspended is retried this long (not ENTRY_RETRY_MINUTES)
 # a cricket entry whose market is suspended (a review, rain, the innings break) is retried this long: SS's 'India 3 odds'
-# on 15 Nov was missed after 5 min of 'market suspended'. Every try still checks the price against the tip.
-CRICKET_SUSPENDED_MINUTES = 12
+# on 15 Nov was missed after 5 min of 'market suspended', 'Adelaide 3.8' on 17 Nov after 12. Every try still checks the
+# price against the tip, so a price that moved away while the market was shut is not taken.
+CRICKET_SUSPENDED_MINUTES = 20
 # a close naming no team this soon after the channel's last close is that close again: SS 15 Nov posted 'Ind match
 # losscut', 'Bookset fav 1.38 ind', then 'Perfect entry perfect bookset', which booked its newer Australia trade
 CLOSE_REPEAT = timedelta(minutes=10)
+# A message older than SIGNAL_MAX_AGE_SECONDS is dropped, but one about a bookset / loss cut / exit still acts up to this
+# late (only its closes): 21 Nov 10:21-10:24 the page hung for 5 min on an entry, and the 3 SS posts that waited behind
+# it were dropped as 117-273s old. A late close is better than none; an entry that old is not taken.
+LATE_CLOSE = timedelta(minutes=10)
+LATE_CLOSE_WORDS = re.compile(r"book\W*se|booksert|cash\W*out|loss\W*c[iu]t|los\W*cut|loss\W*ut|losscat|\bexit\b|"
+                              r"புக்|லாஸ்|எக்ஸிட்", re.IGNORECASE)
 # 'Back mlr', then '10 odds' (SS 15 Nov): a bare price after an entry is that entry's price, not a 10-unit stake.
 # '10 odds' / '4.1 odds' / '3.7' are prices; a bare '2' or '0.5' stays a stake.
 PRICE_ONLY = re.compile(r"^\s*(?:(\d{1,3}(?:\.\d{1,2})?)\s*odds?|(\d{1,2}\.\d{1,2}))\s*$", re.IGNORECASE)
@@ -94,6 +105,28 @@ VOICE_CLOSE_NOW = re.compile(r"பண்ணிடுங்க|பணிடுங
                              r"pann?unga|pann?ik+on?ga|pann?idunga", re.IGNORECASE)
 VOICE_NOT_NOW = re.compile(r"\d\.\d|ரேஞ்ச்|\brange\b|ஓவர்|\bovers?\b|வந்தா|அப்படின்னா|பண்ணனும்|பண்ணியனும்|பண்ணிக்கலாம்|"
                            r"பண்ணலாம்|வரும்|ரெடி|\bready\b|\bwait\b|வெய்ட்", re.IGNORECASE)
+# SS 21 Nov 12:53, a voice note: '1 limit use பணியிருக்கோம், அதுல 0.5 limit எக்ஸிட் பண்ணிக்கலாம். 0.5 மட்டும் ஹோல்டு
+# பண்ணுங்க ... 0.5 limit ரிமூவ் பண்ணுங்க, 0.5 limit மட்டும் இருக்கணும்'. A part exit acts only when both are said:
+# how much goes out (a number, 'limit', an exit word) and how much stays (a number, 'hold' / 'இருக்கணும்').
+VOICE_PART_EXIT = re.compile(r"(\d+(?:\.\d+)?)\s*(?:limit|லிமிட்)\S*\s+(?:\S+\s+)?(?:exit|எக்ஸிட்|ரிமூவ்|remove|"
+                             r"book\W*set|புக்|loss\W*cut|லாஸ்)", re.IGNORECASE)
+VOICE_PART_KEEP = re.compile(r"(\d+(?:\.\d+)?)\s*(?:(?:limit|லிமிட்)\S*\s*)?(?:மட்டும்\s*)?(?:hold|ஹோல்ட|ஹோல்டு|"
+                             r"இருக்கணும்|irukk?anum)", re.IGNORECASE)
+# ... unless it waits for a price or an over ('1.8 வந்தா 0.5 exit'): only one said to do now acts
+VOICE_PART_NOT_NOW = re.compile(r"வந்தா|வந்தோம்|அப்படின்னா|\bif\b|ரேஞ்ச்|\brange\b|ஓவர்|\bovers?\b|வரும்|ரெடி|"
+                                r"\bready\b|\bwait\b|வெய்ட்", re.IGNORECASE)
+
+
+def voice_part_exit(text: str) -> float | None:
+    """The share of the trade a voice note says to keep ('0.5 limit exit ... 0.5 மட்டும் hold' -> 0.5), None when it
+    is not a part exit to do now with both amounts said. Of SS's 304 voice notes to 21 Nov, only that one is."""
+    out, keep = VOICE_PART_EXIT.search(text or ""), VOICE_PART_KEEP.search(text or "")
+    if not out or not keep or VOICE_PART_NOT_NOW.search(text):
+        return None
+    gone, kept = float(out.group(1)), float(keep.group(1))
+    if not (0 < gone <= 5 and 0 < kept <= 5):
+        return None
+    return round(kept / (gone + kept), 4)
 HELP = """🤖 *Commands* (send them here, in Saved Messages)
 /status: bot state, open trades, today's result
 /today, /yesterday: each channel's trades of the day, won / lost, missed tips, deleted messages
@@ -360,6 +393,8 @@ class Pipeline:
         self._last_close: dict[str, datetime] = {}  # channel -> when its last close instruction came (CLOSE_REPEAT)
         self._last_entry: dict[str, tuple[BetSignal, str]] = {}  # channel -> its latest entry and what became of it
         self._entries: dict[str, deque[tuple[BetSignal, str]]] = {}  # channel -> its recent entries, the same way
+        self._unconfirmed_pl: dict[int, float] = {}  # trade id -> what its cashout showed when the site didn't confirm it
+        self._keep_after_close: dict[int, float] = {}  # trade id -> share to put back in once its part exit is booked
 
     # --- messages -------------------------------------------------------------------------------
 
@@ -409,7 +444,8 @@ class Pipeline:
             return
 
         age = (datetime.now(timezone.utc) - msg.date).total_seconds()
-        if age > self._risk.cfg(channel.name).signal_max_age_s:
+        late = age > self._risk.cfg(channel.name).signal_max_age_s
+        if late and not (age <= LATE_CLOSE.total_seconds() and LATE_CLOSE_WORDS.search(msg.text or "")):
             log.info("msg %s ignored: %.0fs old", msg.id, age)
             return
         if channel.profile.jackpot_source:
@@ -440,6 +476,11 @@ class Pipeline:
             history[-1] = (msg.date, context_line(msg.date, f"{msg.text} [screenshot: {parsed.summary}]", False))
         message_id = self._store.log_message(msg.id, msg.text, msg.image is not None, parsed, channel.name)
         log.info("msg %s [%s]: %s (%d signal(s), %s)", msg.id, channel.name, parsed.summary, len(signals), how)
+        if late:  # it waited behind a slow action: its bookset / loss cut still acts, nothing else does
+            others = [sig for sig in signals if sig.action != "close"]
+            signals = [sig for sig in signals if sig.action == "close"]
+            log.info("  msg %s came %.0fs late: only its closes act%s", msg.id, age,
+                     f" ({len(others)} other instruction(s) not taken)" if others else "")
 
         for sig in signals:
             await self._act(sig, msg.text, channel, how, message_id)
@@ -532,8 +573,15 @@ class Pipeline:
         profile = channel.profile
         kept = []
         for index, sig in enumerate(signals):
-            if msg.voice and not (sig.action == "close" and sig.confidence >= VOICE_MIN_CONFIDENCE
-                                  and VOICE_CLOSE_NOW.search(msg.text) and not VOICE_NOT_NOW.search(msg.text)):
+            keep = voice_part_exit(msg.text) if msg.voice else None
+            if (keep is not None and sig.action in ("close", "exit") and sig.confidence >= VOICE_MIN_CONFIDENCE
+                    and sig.market == "match_odds"):
+                # SS 21 Nov 12:53 '0.5 limit எக்ஸிட் ... 0.5 மட்டும் ஹோல்டு' (read as EXIT 0.5u, 0.90): book now, keep a share
+                log.info("  voice note: part exit now, %.0f%% of the trade kept: %r", keep * 100, msg.text[:120])
+                sig = sig.model_copy(update={"action": "close", "loss_cut": True, "keep_share": keep, "odds": None,
+                                             "units": None, "amount": None, "when_odds": None})
+            elif msg.voice and not (sig.action == "close" and sig.confidence >= VOICE_MIN_CONFIDENCE
+                                    and VOICE_CLOSE_NOW.search(msg.text) and not VOICE_NOT_NOW.search(msg.text)):
                 log.info("  voice note: no action on %s (%.2f): %r", sig.describe(), sig.confidence, msg.text[:100])
                 continue
             if (sig.action == "entry" and how == "ai-only" and profile.entry_words and msg.image is None
@@ -559,7 +607,7 @@ class Pipeline:
             if sig.action == "close" and not msg.voice and not_yet(msg.text):
                 log.info("  not a close yet: %r", msg.text[:60])
                 continue
-            if sig.action == "close":
+            if sig.action == "close" and not sig.keep_share:  # a part exit leaves a trade for the next bookset to book
                 unnamed = not sig.selection.strip(" ?") or (
                     not _mentions(msg.text, sig.selection, profile.aliases)
                     and not _mentions(msg.reply_to, sig.selection, profile.aliases))
@@ -1004,6 +1052,8 @@ class Pipeline:
                 return result
             check = self._risk.precheck(sig)
             s = self._risk.cfg(sig)
+            if sig.action == "close" and sig.keep_share and check.ok and check.position:
+                self._keep_after_close[check.position.id] = sig.keep_share
             if not check.ok:
                 result = BetResult("skipped", check.reason)
             elif self._bot is None:
@@ -1023,7 +1073,57 @@ class Pipeline:
             if note:
                 result.reason = f"{note} {result.reason}"
             await self._record(message_id, sig, result, check)
+            if sig.action == "close" and check.position:
+                await self._keep_part_if_due(check.position, result, message_id)
             return result
+
+    async def _keep_part_if_due(self, pos: Position, result: BetResult, message_id: int | None) -> None:
+        """After a part exit's booking went through, the share kept goes back in (the trade lock is held). A booking
+        still being tried keeps its share for later; one that failed drops it."""
+        if result.status in ("placed", "simulated"):
+            share = self._keep_after_close.pop(pos.id, None)
+            if share:
+                await self._keep_part(pos, share, message_id)
+        elif result.status in ("failed", "skipped"):
+            if self._keep_after_close.pop(pos.id, None) and self._notifier:
+                await self._notifier.send(f"⚠️ *PART EXIT not done* on {pos.selection}: the booking failed, so nothing "
+                                          f"was kept or put back. Check the trade on the site.")
+
+    async def _keep_part(self, pos: Position, share: float, message_id: int | None) -> None:
+        """The share of a trade the tipster said to hold ('0.5 limit exit, 0.5 hold'), back in right after the site's
+        Cashout booked all of it: a back sized to return what that share of the old trade returns if it wins
+        (share x stake x old price), at the price on offer now, at most MAX_LIABILITY_PER_BET / MAX_UNITS_PER_BET.
+        Tried KEEP_TRIES times straight away; if it can't go in, you are told to back it by hand. With the lock held."""
+        what = f"{share:.0%} of the {pos.selection} trade ({pos.stake:g} @ {pos.price or 0:g})"
+        sig = BetSignal(action="entry", sport=pos.sport, event=pos.event, market=pos.market, market_name="",
+                        selection=pos.selection, side=pos.side, odds=None, line=None, units=None, amount=None,
+                        loss_cut=False, confidence=1.0, channel=pos.channel or "")
+        if pos.side != "back" or not pos.price:
+            reason = f"PART EXIT: {what} not put back (only a back is): back it by hand if you want it kept"
+            await self._record(message_id, sig, BetResult("failed", reason), Decision(False, reason))
+            return
+        s = self._risk.cfg(pos)
+        result, capped = BetResult("failed", "no price on offer"), ""
+        for _ in range(KEEP_TRIES):
+            price = pos.price if self._bot is None else await self._bot.quote(sig)
+            if not price:
+                result = BetResult("failed", "no price on offer for it now")
+                continue
+            stake, capped = round(share * pos.stake * pos.price / price, 2), ""
+            most = min(x for x in (s.max_liability_per_bet, s.max_units_per_bet * s.unit_stake, float("inf")) if x)
+            if stake > most:
+                stake, capped = most, f"; stake cut from {stake:g} to your cap {most:g}"
+            sig = sig.model_copy(update={"odds": price, "amount": stake})
+            result = (self._simulate(sig, Decision(True, "ok")) if self._bot is None
+                      else await self._bot.place(sig, None))
+            if result.status != "retry":
+                break
+        if result.status in COUNTED:
+            result.reason = f"PART EXIT: {what} kept, back in{capped}: {result.reason}"
+        else:
+            result = BetResult("failed", f"PART EXIT: {what} could NOT go back in ({result.reason}): the whole trade "
+                                         f"is booked; back {pos.selection} by hand to keep that part", result.price)
+        await self._record(message_id, sig, result, Decision(False, "part exit"))
 
     async def _cancel(self, sig: BetSignal, message_id: int | None) -> BetResult:
         """CANCEL <name>: drops a waiting entry and the waiting (unmatched) exit bets on that trade."""
@@ -1059,18 +1159,23 @@ class Pipeline:
         if check.position is None:
             return BetResult("failed", f"{result.reason} (no recorded trade to keep retrying: book it by hand)")
         self._store.mark_close_pending(check.position.id, sig.loss_cut)
-        return BetResult("pending", f"will retry every {BOOKSET_RETRY_SECONDS}s for up to "
+        return BetResult("pending", f"will retry every {CLOSE_RETRY_SECONDS}s for up to "
                                     f"{self._s.bookset_retry_min} min: {result.reason}")
 
     async def retry_pending_closes(self) -> None:
-        """Retries every asked-for bookset / loss cut until the site takes it. A bookset waits up to
-        BOOKSET_GREEN_WAIT_SECONDS for a green (profit) booking, then books anyway; a loss cut books at once.
-        Also drops CONFIRM questions nobody answered."""
+        """Retries every asked-for bookset / loss cut until the site takes it, every CLOSE_RETRY_SECONDS; waiting entries
+        and limit exits every BOOKSET_RETRY_SECONDS. A bookset waits up to BOOKSET_GREEN_WAIT_SECONDS for a green
+        (profit) booking, then books anyway; a loss cut books at once. Also drops CONFIRM questions nobody answered."""
+        last_round = 0.0
         while True:
-            await asyncio.sleep(BOOKSET_RETRY_SECONDS)
-            await self._expire_asked()
-            if self._bot is not None:
-                await self.retry_pending_once()
+            await asyncio.sleep(CLOSE_RETRY_SECONDS)
+            if time.monotonic() - last_round >= BOOKSET_RETRY_SECONDS - 0.5:
+                last_round = time.monotonic()
+                await self._expire_asked()
+                if self._bot is not None:
+                    await self.retry_pending_once()
+            elif self._bot is not None:
+                await self._retry_pending_closes()
 
     async def retry_pending_once(self) -> None:
         """One retry of every pending entry, limit exit, bookset and loss cut."""
@@ -1160,6 +1265,8 @@ class Pipeline:
                 s = self._risk.cfg(current)
                 waited = (datetime.now() - datetime.fromisoformat(current.close_pending_since)).total_seconds()
                 sig = _close_signal(current, bool(current.close_loss_cut))
+                if current.id in self._keep_after_close:
+                    sig = sig.model_copy(update={"keep_share": self._keep_after_close[current.id]})
                 if waited > self._s.bookset_retry_min * 60:
                     self._store.clear_close_pending(current.id)
                     if s.book_only_green:
@@ -1180,6 +1287,7 @@ class Pipeline:
                     self._store.clear_close_pending(current.id)
                 result.reason = f"after {waited:.0f}s of retrying: {result.reason}"
                 await self._record(None, sig, result, Decision(True, "retry", position=current))
+                await self._keep_part_if_due(current, result, None)
 
     async def monitor(self) -> None:
         """Watches the price of every open trade: the last one seen settles a trade whose match ends without a
@@ -2276,12 +2384,23 @@ class Pipeline:
         elif sig.action == "exit" and result.status in COUNTED:
             self._store.set_exit(check.position.id, sig.odds, result.stake, result.status)
         elif sig.action == "close" and result.status in ("placed", "simulated") and check.position:
+            earlier = self._unconfirmed_pl.pop(check.position.id, None)
+            if earlier is not None and "already booked on the site" in result.reason and abs(result.pl or 0) < 0.01:
+                # the site showing the match at 0 on every result: the unconfirmed cashout went through at what it showed
+                result.pl = earlier
+                result.reason += f" (P/L {earlier:+g}, from the cashout that showed no confirmation)"
             self._store.set_closed(check.position.id, pl=result.pl, how="booked")
             if self._notifier:
                 how = "auto-bookset" if "auto-bookset" in result.reason else "bookset / cashout"
                 await self._notifier.send(trade_summary(check.position, how, result.pl, _clock()))
-        elif sig.action == "close" and result.status == "unconfirmed":
-            log.warning("  cashout not confirmed: check the %s trade on the site", sig.selection)
+        elif sig.action == "close" and result.status == "unconfirmed" and check.position:
+            # 20 Nov 16:09 (SS, Adelaide): a cashout in profit showed no confirmation and was never looked at again, so the
+            # trade was settled as if still open. Now it is tried again like a refused one: the next try finds the trade
+            # booked (no Cashout button, every result the same on the site) or books it.
+            self._unconfirmed_pl[check.position.id] = result.pl
+            self._store.mark_close_pending(check.position.id, sig.loss_cut)
+            result.reason += f"; looked at again every {CLOSE_RETRY_SECONDS}s until the site shows it booked"
+            log.warning("  cashout not confirmed: %s is looked at again", sig.selection)
         price = f"{result.price:g}" if result.price else "-"
         log.info("  %s %s | price %s stake %g | %s", result.status.upper(), sig.describe(), price, result.stake,
                  result.reason)
