@@ -260,6 +260,57 @@ def test_a_page_timeout_after_the_placebet_click_is_unconfirmed_and_never_placed
     assert (result.price, result.stake) == (3.65, 50)
 
 
+# --- a channel set to paper_only while live --------------------------------------------------------------
+
+def sk_paper(store, mode="live"):
+    """SK Astro became paper_only at 22:52 on 21 Nov; its live ladder from 20:33 (Emirates) was still watched after the
+    restart, ready to lay the other team at 1.50."""
+    from test_ladder import LadderSite, Scores
+    pipe, site, notifier = make(store, Profile("sk", ladder=True, paper_only=True), {}, live=1.45, mode=mode,
+                                site_class=LadderSite)
+    pipe._cricbuzz = Scores()
+    return pipe, site, notifier
+
+
+def test_a_ladder_waiting_for_its_first_lay_is_dropped_once_its_channel_is_paper_only(store):
+    pipe, site, notifier = sk_paper(store)
+    store.add_ladder("live", "Tip", "UAE", "UAE v Netherlands", datetime.now(), None)
+
+    async def go():
+        await pipe._drop_paper_ladders()
+        for ladder in store.active_ladders("live"):
+            await pipe._ladder_step(ladder)
+
+    asyncio.run(go())
+    assert store.active_ladders("live") == []
+    assert [call for call in site.calls if call[0] == "entry"] == []  # no lay at 1.45
+    assert any("PAPER ONLY" in text for text in notifier.sent)
+
+
+def test_a_paper_only_ladder_with_lays_in_is_kept_for_its_booking_but_takes_no_more_steps(store):
+    pipe, _, _ = sk_paper(store)
+    lid = store.add_ladder("live", "Tip", "UAE", "UAE v Netherlands", datetime.now(), None)
+    store.update_ladder(lid, entries=1)
+    asyncio.run(pipe._drop_paper_ladders())
+    kept = store.active_ladders("live")
+    assert [ladder.id for ladder in kept] == [lid]
+    assert pipe._ladder_entries_off(kept[0]).startswith("PAPER ONLY")
+
+
+def test_on_paper_a_paper_only_channels_ladder_goes_on(store):
+    pipe, _, _ = sk_paper(store, mode="dry_run")
+    store.add_ladder("dry_run", "Tip", "UAE", "UAE v Netherlands", datetime.now(), None)
+    asyncio.run(pipe._drop_paper_ladders())
+    assert len(store.active_ladders("dry_run")) == 1
+
+
+def test_a_waiting_entry_of_a_channel_now_paper_only_is_dropped_not_placed(store):
+    pipe, site, _ = make(store, Profile("raftaar", paper_only=True), {}, live=3.0)
+    store.add_pending(signal(odds=3.0, units=1, channel="Tip", **PERTH), "live", None, "market suspended")
+    asyncio.run(pipe.retry_pending_once())
+    assert site.calls == [] and store.pending_instructions("live") == []
+
+
 class HungSite(FakeSite):
     async def place(self, sig, position, require_green=False):
         self.calls.append((sig.action, sig.selection, sig.amount or sig.units))

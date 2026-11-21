@@ -1187,7 +1187,7 @@ class Pipeline:
         again, so a stale price is never taken; after ENTRY_RETRY_MINUTES (CONDITIONAL_ENTRY_MINUTES for a
         waiting entry) the tip is reported as missed."""
         for pending_id, created_at, sig, message_id, last_reason in self._store.pending_instructions(self._mode):
-            if sig.action == "entry" and sig.channel in self._stopped:
+            if sig.action == "entry" and (sig.channel in self._stopped or self._paper_in_live(sig.channel)):
                 self._store.remove_pending(pending_id)
                 reason = self._entries_off(sig.channel)
                 await self._record(message_id, sig, BetResult("skipped", reason), Decision(False, reason))
@@ -1427,6 +1427,7 @@ class Pipeline:
         looked: dict[int, datetime] = {}
         while True:
             await asyncio.sleep(LADDER_FAST_POLL.total_seconds())
+            await self._drop_paper_ladders()
             for ladder in self._store.active_ladders(self._mode):
                 now = datetime.now()
                 if self._ladder_hot.get(ladder.id, datetime.min) <= now and \
@@ -1437,6 +1438,15 @@ class Pipeline:
                     await self._ladder_step(ladder)
                 except Exception:
                     log.exception("SK method: could not look at %s", ladder.team)
+
+    async def _drop_paper_ladders(self) -> None:
+        """Tips waiting for their first lay from a channel now paper_only (live) are dropped, as /stop drops them; one that
+        has lays in keeps being watched, so it is still booked, but takes no more steps (_ladder_entries_off)."""
+        for ladder in self._store.active_ladders(self._mode):
+            off = self._ladder_entries_off(ladder)
+            if off.startswith("PAPER ONLY") and not ladder.entries:
+                self._store.end_ladder(ladder.id, f"dropped: {off}")
+                await self._ladder_note(ladder, f"dropped before any lay: {off}")
 
     async def _ladder_hurry(self, ladder: Ladder, step: int, reason: str) -> None:
         """The site refused an entry for a reason that passes (the price moved, a suspended market): looked at again in
@@ -2215,6 +2225,14 @@ class Pipeline:
             return "PAUSED: no new entries until /resume"
         if channel in self._stopped:
             return f"STOPPED: no new entries from {channel} until /start {channel}"
+        return self._paper_in_live(channel)
+
+    def _paper_in_live(self, channel: str) -> str:
+        """A channel set to paper_only places nothing real in a live run, also what it tipped before ('' = it may). 21 Nov
+        SK Astro became paper_only at 22:52, and its live ladder from 20:33 (Emirates) was still watched to lay at 1.50."""
+        found = self._channels.get(channel) if channel else None
+        if self._mode == "live" and found is not None and found.profile.paper_only:
+            return f"PAPER ONLY: {channel} places no real bets in a live run (channels.json)"
         return ""
 
     def _ladder_entries_off(self, ladder: Ladder) -> str:
