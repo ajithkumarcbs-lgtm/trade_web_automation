@@ -247,6 +247,59 @@ def test_words_like_the_typos_are_not_closes(text):
     assert parse_known(text, "ss") is None
 
 
+# --- the long shots: '50% bookset now' and 'Fav 1.3 bookset' ------------------------------------------------------
+
+PAK = dict(selection="Pakistan", event="Pakistan v England", sport="cricket")
+AA = dict(selection="Arabian Aces", event="Arabian Aces v Royal Champs", sport="cricket")
+
+
+def test_a_percent_bookset_books_that_share_and_keeps_the_rest(store):
+    """SS 25 Oct 'Funny entry now 1000 odds back pak 5% green' (Pakistan won), then '50% bookset now' at 21:08. The rules
+    took '50%' for the team, overruled the AI's Pakistan, and the close failed ('no recorded trade'); the 'Bookset now'
+    two minutes later was dropped as the same close again. Half is booked now and half kept."""
+    script = {"20 odds back pak limit 1": [signal(odds=20.0, units=1, **PAK)],
+              "50% bookset now": [signal(action="close", odds=None, **PAK)]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss"), script, live=20.0)
+
+    async def go():
+        await pipe._handle(msg("20 odds back pak limit 1"))
+        site.live = 8.0
+        await pipe._handle(msg("50% bookset now"))
+
+    asyncio.run(go())
+    assert [call[0] for call in site.calls] == ["entry", "close", "entry"]
+    assert site.calls[-1][2] == 1250  # half of 1000 @ 20 kept: 0.5 x 1000 x 20 / 8
+
+
+def test_a_bookset_naming_the_favourite_books_the_channels_trade(store):
+    """SS 7 Nov 'Fav 1.3 bookset' (Arabian Aces had become the 1.3 favourite), read as a close of 'Fav': not found."""
+    script = {"3.5 odds back aa limit 1": [signal(odds=3.5, units=1, **AA)],
+              "Fav 1.3 bookset": [signal(action="close", odds=None, selection="Fav", event="? v ?", sport="cricket")]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss"), script, live=3.5)
+
+    async def go():
+        await pipe._handle(msg("3.5 odds back aa limit 1"))
+        site.live = 1.3
+        await pipe._handle(msg("Fav 1.3 bookset"))
+
+    asyncio.run(go())
+    assert [call[0] for call in site.calls] == ["entry", "close"]
+    assert store.find_position("Arabian Aces", "live") is None
+
+
+@pytest.mark.parametrize("text", ["50% bookset now", "Fav 1.3 bookset", "1.3 bookset"])
+def test_numbers_and_fav_before_a_bookset_are_not_a_team(text):
+    from tradebot.rules import parse_known
+    sig = parse_known(text, "ss")[0]
+    assert (sig.action, sig.selection) == ("close", "")
+
+
+def test_a_team_before_a_bookset_is_still_its_name():
+    from tradebot.rules import parse_known
+    assert parse_known("Ind bookset", "ss")[0].selection == "ind"
+    assert parse_known("Eng losscut now", "ss")[0].selection == "eng"
+
+
 # --- the balance -------------------------------------------------------------------------------------------
 
 def test_a_short_balance_cuts_the_stake_instead_of_skipping():

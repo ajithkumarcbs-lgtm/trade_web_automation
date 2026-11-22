@@ -39,7 +39,7 @@ from tradebot.notifier import (Notifier, bet_alert, confirm_request, day_report,
                                trade_summary)
 from tradebot.risk import Decision, RiskManager, booked_profit, other_runners_price
 from tradebot.names import contains_player, same_name
-from tradebot.rules import fresh_part_of_paste, name_words, not_yet, parse_known, parse_strict, reconcile
+from tradebot.rules import NOT_NAMES, fresh_part_of_paste, name_words, not_yet, parse_known, parse_strict, reconcile
 from tradebot.skyfair import is_skyfair
 from tradebot.signal_parser import CONTEXT_MESSAGES, CONTEXT_WINDOW, VOICE_HINT, context_line, expand_team, make_parser
 from tradebot import store as trade_log
@@ -261,6 +261,9 @@ def _same_match(a: BetSignal, b: BetSignal) -> bool:
 GLUED = re.compile(r"([A-Za-z])(\d)")
 # SS's text part exit, '0.5 limit exit now' (4 Nov): that many limits out now, the rest kept
 TEXT_PART_EXIT = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:limit|lmt)s?\s*(?:exit|remove|out|book\W*set)\b", re.IGNORECASE)
+# '50% bookset now' (SS 25 Oct 21:08, on the Pakistan long shot that won): that share booked now, the rest kept
+PCT_PART_EXIT = re.compile(r"(?<![\d.])(\d{1,2}(?:\.\d+)?)\s*%\s*(?:book\W*set|booksey|exit|cash\W*out|out|remove)\b",
+                           re.IGNORECASE)
 
 
 def _merge_stake(signals: list[BetSignal]) -> list[BetSignal]:
@@ -632,6 +635,17 @@ class Pipeline:
                 log.info("  part exit now: %s limit out of the trade: %r", part.group(1), msg.text[:80])
                 sig = sig.model_copy(update={"action": "close", "loss_cut": True, "exit_units": float(part.group(1)),
                                              "odds": None, "units": None, "amount": None, "when_odds": None})
+            elif (not msg.voice and sig.action in ("exit", "close") and sig.market == "match_odds"
+                    and (pct := PCT_PART_EXIT.search(msg.text or "")) and 0 < float(pct.group(1)) < 100
+                    and not not_yet(msg.text)):
+                share = round(1 - float(pct.group(1)) / 100, 4)
+                log.info("  part exit now: %s%% booked, %.0f%% of the trade kept: %r", pct.group(1), share * 100,
+                         msg.text[:80])
+                sig = sig.model_copy(update={"action": "close", "loss_cut": True, "keep_share": share, "odds": None,
+                                             "units": None, "amount": None, "when_odds": None})
+            if sig.action in ("close", "exit") and sig.selection.strip(" ?").lower() in NOT_NAMES:
+                # SS 7 Nov 'Fav 1.3 bookset', read as a close of 'Fav': no team named, so the channel's trade
+                sig = sig.model_copy(update={"selection": "", "event": "? v ?", "aka": ""})
             if (sig.action == "entry" and how == "ai-only" and profile.entry_words and msg.image is None
                     and not re.search(profile.entry_words, msg.text, re.IGNORECASE)):
                 log.info("  not an entry: %r has none of the entry words of %s", msg.text[:60], channel.name)

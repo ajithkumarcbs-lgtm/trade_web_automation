@@ -97,12 +97,19 @@ def test_sss_typo_closes_reach_the_ai():
     assert not AI_WORDS.search("booksellers market")
 
 
-def test_a_long_shot_takes_a_price_up_to_25_percent_below_the_tip(store):
+def test_a_long_shot_takes_a_price_down_to_half_the_tip_never_below_8(store):
     risk = RiskManager(make_settings(odds_tolerance=0.1), store, "live")
     assert risk.price_check(signal(odds=20.0, units=0.5), 17.7).ok  # lay 1.06 = back 17.7
     assert risk.price_check(signal(odds=10.0, units=0.5), 8.6).ok
-    assert not risk.price_check(signal(odds=10.0, units=0.5), 7.0).ok
+    assert not risk.price_check(signal(odds=10.0, units=0.5), 7.0).ok  # below 8: no longer a long shot
     assert not risk.price_check(signal(odds=5.0, units=0.5), 4.4).ok  # below 10 the channel's 10% stays
+    # 22 Nov '27 odds bh back very very small amount': the site's 17.67 (lay 1.06) was refused at 25%
+    assert risk.price_check(signal(odds=27.0, units=0.3), 17.67).ok
+    assert not risk.price_check(signal(odds=27.0, units=0.3), 13.4).ok  # half of 27 is 13.5
+    # 25 Oct 'Funny entry now 1000 odds back pak' (Pakistan won): no site shows 1000; read as 40, so 20 or more
+    assert risk.price_check(signal(odds=1000.0, units=0.3), 26.0).ok
+    assert not risk.price_check(signal(odds=1000.0, units=0.3), 19.0).ok
+    assert risk.price_check(signal(odds=12.0, units=0.3), 10.09).ok  # 19 Nov 'Sty back 12 odds' at lay 1.11
 
 
 def test_a_suspended_cricket_market_is_retried_20_minutes(store):

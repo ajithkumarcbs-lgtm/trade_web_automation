@@ -287,8 +287,9 @@ def parse_known(text: str, rules: str, reply_to: str = "") -> list[BetSignal] | 
         before = line[:m.start()].strip()
         # Only "<team> bookset [now]" names the trade ("Eng bookset"); otherwise the latest trade of the channel.
         name = before if before and len(line.split()) <= 3 and not FILLER.match(before) else ""
-        if name in NOT_NAMES:
-            name = ""
+        # its words, not numbers or 'fav': SS 25 Oct '50% bookset now' was read as a trade on '50%' and 7 Nov 'Fav 1.3
+        # bookset' as one on 'fav 1.3'; neither was found ('no recorded trade') and both trades stayed unbooked
+        name = " ".join(w for w in re.findall(r"[a-z]+", name) if w not in NOT_NAMES)
         return [_signal("close", name, loss_cut="loss" in m["word"])]
     return None
 
