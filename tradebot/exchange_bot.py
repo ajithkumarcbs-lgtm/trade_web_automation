@@ -603,6 +603,8 @@ class ExchangeBot:
                 raise BetAborted("retry", exc.reason) from exc
             raise
         if limit and (price is None or price > limit):  # the site takes no bet above it: book on the other runner
+            if price is None and await self._other_runner() is None:
+                raise BetAborted("retry", "no price on offer")  # a market with a draw: wait for a price, as before
             if side == "back":
                 return await self._hedge_back_as_lay(sig, win, lose, require_green)
             return await self._hedge_lay_as_back(sig, win, lose, require_green)

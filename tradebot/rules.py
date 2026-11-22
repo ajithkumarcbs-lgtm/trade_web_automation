@@ -148,7 +148,10 @@ RAFTAAR_CLOSE = re.compile(r"\bbook ?set cash ?out\b")
 # the context; '20 Over 179 Not Pass' is a result.
 BOSS_OVER = re.compile(r"^(?P<over>\d{1,2}) over (?P<line>\d{1,3}) (?P<side>yes|not|no) (?P<team>(?!pass\b|fail\b)[a-z]+(?: [a-z]+){0,2})$")
 BOSS_WICKET = re.compile(r"^(?P<wicket>\d)(?:st|nd|rd|th) wicket call (?P<team>[a-z]+(?: w)?) (?P<line>\d{1,3}) k (?P<way>under|upar) jayega\b")
-CLOSE_WORDS = r"(?P<word>bookset|book set|boookset|bookser|losscut|loss cut|cashout|book pannuga|book pannunga)"
+# SS's typos are closes too, read without the AI (its limit or the network can fail it): 'Booksey' (12 Nov), 'Losscit 🔥'
+# (14 Nov), 'Bookse' (15 Nov), 'Booksert', 'Loss ut now' (11 Nov), 'Losscat'
+CLOSE_WORDS = (r"(?P<word>bookset|book set|boookset|booksert|bookser|booksey|\bbookse\b|losscut|loss cut|losscit|loss cit|"
+               r"losscat|\bloss ?ut\b|\blos cut\b|cashout|book pannuga|book pannunga)")
 # "Bookset coming", "Ready for bookset", "Japan trade possible ... boookset": not yet
 # "Cashout khudse kr lena" (cash out yourself): the tipster gives no exit, so no close either
 NOT_YET = re.compile(r"\b(coming|ready|be active|wait|soon|if|zone|possible|your choice|chance|anybody|khudse)\b")

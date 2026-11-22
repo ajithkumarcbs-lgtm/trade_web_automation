@@ -77,6 +77,12 @@ RESULT_POST = re.compile(r"(?<![\d.])(?:\d+(?:\.\d+)?|one|half|two)\s*(?:limit|l
                          r"(?:loss|lose|lost|profit|gain)\b|\blossed\b", re.IGNORECASE)
 CLOSE_NOW_WORDS = re.compile(LATE_CLOSE_WORDS.pattern + r"|\bbook|\bcut\b|\bclose\b|\bnow\b|\bout\b|\bremove\b|"
                              r"\bnikal|\bkaro\b|\bkro\b", re.IGNORECASE)
+# A booking told as done, or praised, is a report: SS 1 Nov 14:22 '3 rd jackpot done ✅ booksey' (an earlier match) came a
+# minute after the Ireland entry; 22 Nov 18:32 'Bookset mini jackpot done ✅💯' after the GG loss cut; 'Perfect entry point
+# and bookset point 🔥🔥✅' (14 Nov) after the bookset. None of SS's 27 closes of 22 Oct-21 Nov said 'done' or 'perfect';
+# with 'now' it still acts ('Jackpot biggest done bookset now', 6 Nov).
+DONE_REPORT = re.compile(r"\bdone\b|\bperfect\b", re.IGNORECASE)
+NOW_WORDS = re.compile(r"\bnow\b|\bimmediately\b|\bfast\b|\bquick", re.IGNORECASE)
 # 'Back mlr', then '10 odds' (SS 15 Nov): a bare price after an entry is that entry's price, not a 10-unit stake.
 # '10 odds' / '4.1 odds' / '3.7' are prices; a bare '2' or '0.5' stays a stake.
 PRICE_ONLY = re.compile(r"^\s*(?:(\d{1,3}(?:\.\d{1,2})?)\s*odds?|(\d{1,2}\.\d{1,2}))\s*$", re.IGNORECASE)
@@ -245,6 +251,13 @@ def _mentions(text: str, name: str, aliases: dict[str, str]) -> bool:
     return contains_player(name, expanded) or any(same_name(word, name) for word in name_words(text))
 
 
+def _same_match(a: BetSignal, b: BetSignal) -> bool:
+    """Are two entries in one match: a team of one (its selection, or a side named in its event) is a team of the other."""
+    def teams(sig: BetSignal) -> list[str]:
+        return [t for t in [sig.selection, *re.split(r"\s+v\s+", sig.event)] if t.strip(" ?")]
+    return any(contains_player(x, y) or contains_player(y, x) for x in teams(a) for y in teams(b))
+
+
 GLUED = re.compile(r"([A-Za-z])(\d)")
 # SS's text part exit, '0.5 limit exit now' (4 Nov): that many limits out now, the rest kept
 TEXT_PART_EXIT = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:limit|lmt)s?\s*(?:exit|remove|out|book\W*set)\b", re.IGNORECASE)
@@ -268,6 +281,7 @@ SURE_WINNER, SURE_LOSER = 1.10, 11.0  # a runner's last price before its market 
 RE_ENTRY_PRICE_MOVE = 0.15  # an entry on a team already traded, at a price this far from the trade's: an add
 RE_ENTRY_MIN_AGE = timedelta(minutes=10)  # ... if the trade is at least this old
 TIPPED_LATELY = timedelta(minutes=60)  # an entry naming no team takes the team of an entry tip this recent
+EARLIER_TIP = timedelta(hours=8)  # a close naming no team may be for a team the channel tipped this recently (2 matches on)
 LIMIT_ALERT_EVERY = timedelta(minutes=15)  # messages missed through the AI's limit: one summary alert at most this often
 FANCY_POLL = timedelta(minutes=2)  # Cricbuzz lists a match's latest ~9 overs: read often enough to see every over
 FANCY_GIVE_UP = timedelta(hours=18)  # a fancy tip with no result by then is closed as 'unknown'
@@ -418,7 +432,8 @@ class Pipeline:
         self._held: dict[str, Held] = {}  # channel -> entry waiting for its stake message
         self._last_close: dict[str, datetime] = {}  # channel -> when its last close instruction came (CLOSE_REPEAT)
         self._last_entry: dict[str, tuple[BetSignal, str]] = {}  # channel -> its latest entry and what became of it
-        self._entries: dict[str, deque[tuple[BetSignal, str]]] = {}  # channel -> its recent entries, the same way
+        # channel -> its recent entries, the same way, and when each was recorded
+        self._entries: dict[str, deque[tuple[BetSignal, str, datetime]]] = {}
         self._unconfirmed_pl: dict[int, float] = {}  # trade id -> what its cashout showed when the site didn't confirm it
         self._keep_after_close: dict[int, float] = {}  # trade id -> share to put back in once its part exit is booked
 
@@ -640,8 +655,9 @@ class Pipeline:
             if sig.action == "close" and not msg.voice and not_yet(msg.text):
                 log.info("  not a close yet: %r", msg.text[:60])
                 continue
-            if (sig.action == "close" and not msg.voice and RESULT_POST.search(msg.text or "")
-                    and not CLOSE_NOW_WORDS.search(msg.text or "")):
+            if sig.action == "close" and not msg.voice and (
+                    (RESULT_POST.search(msg.text or "") and not CLOSE_NOW_WORDS.search(msg.text or ""))
+                    or (DONE_REPORT.search(msg.text or "") and not NOW_WORDS.search(msg.text or ""))):
                 log.info("  not a close: %r reports a result, it asks for nothing", msg.text[:60])
                 continue
             if sig.action == "close" and not (sig.keep_share or sig.exit_units):  # a part exit leaves a trade to book
@@ -671,6 +687,14 @@ class Pipeline:
                     placed = status in (*COUNTED, "pending")
                     if placed and sig.selection and self._open_trade(sig, channel):
                         pass  # "Again bookset" for an earlier trade still open: the AI's team, not the newest entry
+                    elif placed and (earlier := self._tipped_in_other_match(sig, channel, entry)) is not None:
+                        # SS 1 Nov 14:46 'Now bookset' (AI: India): India tipped at 12:54 (missed on its price), Ireland
+                        # at 14:21 in another match; SS's voice then said the bookset was India's. Booking Ireland, the
+                        # newest entry, would have closed a trade SS kept: nothing is booked.
+                        log.info("  close: %s, tipped earlier in another match (%s), is the trade meant, not %s's latest "
+                                 "entry %s; the bot holds none on %s, so nothing is booked", sig.selection, earlier.event,
+                                 channel.name, entry.selection, sig.selection)
+                        continue
                     elif not placed and self._store.find_position(entry.selection, self._mode, channel.name,
                                                                   strict=True) is None:
                         # (a re-entry skipped while the first trade on its team is open leaves the close for that)
@@ -918,9 +942,26 @@ class Pipeline:
 
     def _again_entry(self, channel: Channel) -> tuple[BetSignal, str] | None:
         """The channel's latest entry on a team it had already booked a trade on (and what became of it)."""
-        for entry, status in reversed(self._entries.get(channel.name, ())):
+        for entry, status, _ in reversed(self._entries.get(channel.name, ())):
             if self._store.recently_closed(entry.selection, self._mode):
                 return entry, status
+        return None
+
+    def _tipped_in_other_match(self, sig: BetSignal, channel: Channel, latest: BetSignal) -> BetSignal | None:
+        """The channel's entry on the AI's team for this close in the last EARLIER_TIP, in another match than its latest
+        entry. None when there is none, or when the AI's team is the latest entry's opponent (taken from the match name:
+        SS 24 Oct 'Bookset enjoy jackpot' was read as India's while New Zealand was SS's trade)."""
+        if not sig.selection.strip(" ?") or same_name(latest.selection, sig.selection):
+            return None
+        if any(contains_player(sig.selection, side) or contains_player(side, sig.selection)
+               for side in re.split(r"\s+v\s+", latest.event) if side.strip(" ?")):
+            return None
+        now = datetime.now()
+        for entry, _, when in reversed(self._entries.get(channel.name, ())):
+            if now - when > EARLIER_TIP:
+                break
+            if same_name(entry.selection, sig.selection) and not _same_match(entry, latest):
+                return entry
         return None
 
     def _same_team_as_last_entry(self, sig: BetSignal, channel: Channel) -> bool:
@@ -2440,7 +2481,7 @@ class Pipeline:
             names = {k: v for k, v in (("selection", result.name), ("event", result.event)) if v}
             entry = sig.model_copy(update=names)
             self._last_entry[sig.channel] = (entry, result.status)
-            self._entries.setdefault(sig.channel, deque(maxlen=10)).append((entry, result.status))
+            self._entries.setdefault(sig.channel, deque(maxlen=10)).append((entry, result.status, datetime.now()))
             if result.status in COUNTED:
                 self._store.open_position(entry, self._mode, result.price, result.stake, self._risk.cfg(sig).unit_stake)
         elif sig.action == "exit" and result.status in COUNTED:

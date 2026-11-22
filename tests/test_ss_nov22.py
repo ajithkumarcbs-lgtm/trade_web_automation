@@ -153,6 +153,88 @@ def test_a_result_post_is_not_a_loss_cut(store, text, closes):
     assert [call[0] for call in site.calls] == (["entry", "close"] if closes else ["entry"])
 
 
+# --- two matches at once: a close naming no team ----------------------------------------------------------------
+
+IND = dict(selection="India", event="India v New Zealand", sport="cricket")
+SYS = dict(selection="Sydney Sixers", event="Sydney Sixers v Hobart Hurricanes", sport="cricket")
+IRE = dict(selection="Ireland", event="Ireland v Namibia", sport="cricket")
+NZ = dict(selection="New Zealand", event="New Zealand v India", sport="cricket")
+
+
+def test_a_close_for_a_team_tipped_earlier_in_another_match_does_not_book_the_newest_trade(store):
+    """SS 1 Nov: '3 odds back ind' 12:54 (missed: India at 2.47), Sixers 13:54, '2.9 odds Ireland back limit 1' 14:21, then
+    'Now bookset' 14:46, read by the AI as India's, and SS's voice at 14:49: 'India... bookset now'. The bot booked Ireland,
+    its newest trade, which SS kept (and added to at 6.4). India's bookset now books nothing."""
+    script = {"3 odds back ind": [signal(odds=3.0, units=0.5, **IND)],
+              "4.5odds sys back limit 1": [signal(odds=4.5, units=1, **SYS)],
+              "2.9 odds Ireland back limit 1": [signal(odds=2.9, units=1, **IRE)],
+              "Now bookset": [signal(action="close", odds=None, **IND)]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss"), script, live=2.47)
+
+    async def go():
+        await pipe._handle(msg("3 odds back ind"))
+        site.live = 4.5
+        await pipe._handle(msg("4.5odds sys back limit 1"))
+        site.live = 2.9
+        await pipe._handle(msg("2.9 odds Ireland back limit 1"))
+        await pipe._handle(msg("Now bookset"))
+
+    asyncio.run(go())
+    assert [call[0] for call in site.calls if call[0] == "close"] == []
+    assert store.find_position("Ireland", "live") is not None and store.find_position("Sydney Sixers", "live") is not None
+
+
+def test_a_close_read_as_the_latest_trades_opponent_books_the_latest_trade(store):
+    """SS 24 Oct 'Bookset enjoy jackpot 🔥🔥✅' was read as India's (the other side of New Zealand v India) while New Zealand
+    was SS's trade: the latest entry is booked, as before."""
+    script = {"3.8 odds nz back limit 1": [signal(odds=3.8, units=1, **NZ)],
+              "Bookset enjoy jackpot 🔥🔥✅": [signal(action="close", odds=None, **IND)]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss"), script, live=3.8)
+
+    async def go():
+        await pipe._handle(msg("3.8 odds nz back limit 1"))
+        await pipe._handle(msg("Bookset enjoy jackpot 🔥🔥✅"))
+
+    asyncio.run(go())
+    assert ("close", "New Zealand") in [call[:2] for call in site.calls]
+    assert store.find_position("New Zealand", "live") is None
+
+
+@pytest.mark.parametrize("text,closes", [
+    ("3 rd jackpot done ✅ booksey", False),         # 1 Nov 14:22, about an earlier match, a minute after Ireland's entry
+    ("Perfect entry point and bookset point 🔥🔥✅", False),
+    ("Bookset 🔥💯🔥 done ✅✅ jackpot", False),
+    ("Jackpot biggest done bookset now", True),     # 6 Nov: 'now' asks for it
+    ("Booksey", True),
+])
+def test_a_booking_told_as_done_is_a_report(store, text, closes):
+    script = {"2.9 odds Ireland back limit 1": [signal(odds=2.9, units=1, **IRE)]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss"), script, live=2.9)
+
+    async def go():
+        await pipe._handle(msg("2.9 odds Ireland back limit 1"))
+        await pipe._handle(msg(text))  # the AI reads nothing (as on 1 Nov): the rules' reading
+
+    asyncio.run(go())
+    assert [call[0] for call in site.calls] == (["entry", "close"] if closes else ["entry"])
+
+
+@pytest.mark.parametrize("text,loss_cut", [
+    ("Losscit 🔥", True), ("Booksey", False), ("Bookse", False), ("Booksert", False), ("Loss ut now", True),
+    ("Losscat", True), ("Bookset", False), ("Losscut 🔥🔥✅", True),
+])
+def test_sss_typo_closes_are_read_without_the_ai(text, loss_cut):
+    from tradebot.rules import parse_known
+    sig = parse_known(text, "ss")[0]
+    assert (sig.action, sig.loss_cut) == ("close", loss_cut)
+
+
+@pytest.mark.parametrize("text", ["Bookset coming be active", "Nab vs irl", "Booksellers", "lossless"])
+def test_words_like_the_typos_are_not_closes(text):
+    from tradebot.rules import parse_known
+    assert parse_known(text, "ss") is None
+
+
 # --- the balance -------------------------------------------------------------------------------------------
 
 def test_a_short_balance_cuts_the_stake_instead_of_skipping():
@@ -303,7 +385,11 @@ def hedge_bot(store, lay_price):
         called.append(("lay_as_back", win, lose))
         return BetResult("placed", "booked", pl=-847.62)
 
+    async def two_runners():
+        return "Adelaide Strikers W"
+
     bot._odds_box, bot._site_book, bot._odds_box_when_open, bot._hedge_lay_as_back = row, book, box, lay_as_back
+    bot._other_runner = two_runners
     return bot, called
 
 
@@ -313,6 +399,18 @@ def test_a_booking_lay_above_10_backs_the_other_runner(store, lay_price):
     result = asyncio.run(bot._hedge_now(signal(action="close", odds=None, **BH), "Brisbane Heat", None))
     assert called == [("box", "lay", False), ("lay_as_back", 2200.0, -1000.0)]
     assert result.pl == -847.62
+
+
+def test_a_booking_with_no_price_in_a_market_with_a_draw_waits_for_one(store):
+    bot, called = hedge_bot(store, None)
+
+    async def three_runners():
+        return None
+
+    bot._other_runner = three_runners
+    with pytest.raises(BetAborted) as info:
+        asyncio.run(bot._hedge_now(signal(action="close", odds=None, **BH), "Brisbane Heat", None))
+    assert info.value.status == "retry" and called == [("box", "lay", False)]
 
 
 def test_the_lay_as_back_booking_bets_the_other_runner(store):
