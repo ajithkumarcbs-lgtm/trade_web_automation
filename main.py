@@ -71,6 +71,12 @@ CLOSE_REPEAT = timedelta(minutes=10)
 LATE_CLOSE = timedelta(minutes=10)
 LATE_CLOSE_WORDS = re.compile(r"book\W*se|booksert|cash\W*out|loss\W*c[iu]t|los\W*cut|loss\W*ut|losscat|\bexit\b|"
                               r"புக்|லாஸ்|எக்ஸிட்", re.IGNORECASE)
+# A P/L report is not a close: SS 22 Nov 13:00 'First match / Bh 1 limit loss 👍' was read as a loss cut of the BH trade
+# (still open, the match not over). Only with none of the close words (CLOSE_NOW_WORDS): '1 limit loss cut now' acts.
+RESULT_POST = re.compile(r"(?<![\d.])(?:\d+(?:\.\d+)?|one|half|two)\s*(?:limit|lmt|unit)s?\s*(?:only\s*)?"
+                         r"(?:loss|lose|lost|profit|gain)\b|\blossed\b", re.IGNORECASE)
+CLOSE_NOW_WORDS = re.compile(LATE_CLOSE_WORDS.pattern + r"|\bbook|\bcut\b|\bclose\b|\bnow\b|\bout\b|\bremove\b|"
+                             r"\bnikal|\bkaro\b|\bkro\b", re.IGNORECASE)
 # 'Back mlr', then '10 odds' (SS 15 Nov): a bare price after an entry is that entry's price, not a 10-unit stake.
 # '10 odds' / '4.1 odds' / '3.7' are prices; a bare '2' or '0.5' stays a stake.
 PRICE_ONLY = re.compile(r"^\s*(?:(\d{1,3}(?:\.\d{1,2})?)\s*odds?|(\d{1,2}\.\d{1,2}))\s*$", re.IGNORECASE)
@@ -633,6 +639,10 @@ class Pipeline:
                 continue
             if sig.action == "close" and not msg.voice and not_yet(msg.text):
                 log.info("  not a close yet: %r", msg.text[:60])
+                continue
+            if (sig.action == "close" and not msg.voice and RESULT_POST.search(msg.text or "")
+                    and not CLOSE_NOW_WORDS.search(msg.text or "")):
+                log.info("  not a close: %r reports a result, it asks for nothing", msg.text[:60])
                 continue
             if sig.action == "close" and not (sig.keep_share or sig.exit_units):  # a part exit leaves a trade to book
                 unnamed = not sig.selection.strip(" ?") or (

@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -351,7 +351,7 @@ class ExchangeBot:
             decision = self._risk.price_check(sig, price)
             if not decision.ok:
                 raise BetAborted("skipped", decision.reason, price)
-            await self._check_balance(decision.liability, price)
+            share = await self._check_balance(decision.liability, price)
             slip = await self._open_slip(cell)
             log.info("  bet slip open")
             await self._set_unmatch(slip, False)  # take the price now; never leave an entry waiting
@@ -365,7 +365,11 @@ class ExchangeBot:
                 price = slip_price
             if attempt and price:
                 decision, price = await self._cushion(sig, slip, decision, price)
+            if share < 1:  # the balance covers only part of the tip's stake (at least MIN_BALANCE_SHARE of it)
+                decision = _cut_stake(decision, share)
             result = await self._submit(sig, slip, decision.stake, decision.liability, price)
+            if share < 1:
+                result.reason += f"; stake cut to {decision.stake:g} ({share:.0%} of the tip's): what the balance covered"
             if decision.reason != "ok":  # e.g. IGNORE_SLIPPAGE in a dry run
                 result.reason = f"{result.reason} [{decision.reason}]"
             if not (result.status == "failed" and _price_moved(result.reason) and attempt == 0):
@@ -413,14 +417,16 @@ class ExchangeBot:
         if not decision.ok:
             raise BetAborted("skipped", decision.reason, round(back_odds, 2))
         back_odds, lay_stake, risk = lay_instead_of_back(decision.stake, lay_price)
-        await self._check_balance(risk, lay_price)
+        share = await self._check_balance(risk, lay_price)
+        wanted = round(decision.stake * share, 2)  # the back it stands for, cut when the balance covers only part
+        back_odds, lay_stake, risk = lay_instead_of_back(wanted, lay_price)
         slip = await self._open_slip(cell)
         log.info("  back %s (price %s, limit %g): laying %s %g @ %g instead (= back @ %.2f)", sig.selection, shown,
                  limit, other, lay_stake, lay_price, back_odds)
         await self._set_unmatch(slip, False)
         slip_price = _to_float(await slip.locator(sel.ODDS_INPUT).input_value())
         if slip_price is not None and slip_price != lay_price:  # moved between reading the box and clicking
-            back_odds, lay_stake, risk = lay_instead_of_back(decision.stake, slip_price)
+            back_odds, lay_stake, risk = lay_instead_of_back(wanted, slip_price)
             moved = self._risk.price_check(sig, back_odds)
             if not moved.ok:
                 raise BetAborted("skipped", f"price moved in the slip: {moved.reason}", round(back_odds, 2))
@@ -431,6 +437,8 @@ class ExchangeBot:
         back_stake = round(placed / (back_odds - 1), 2)  # what the lay stands for, as a back on A
         result.reason = (f"{result.reason}; placed as LAY {other} {placed:g} @ {lay_price:g} = BACK {sig.selection} "
                          f"{back_stake:g} @ {back_odds:.2f} (the site takes no back above {limit:g})")
+        if share < 1:
+            result.reason += f"; stake cut to {share:.0%} of the tip's: what the balance covered"
         result.price, result.stake, result.liability = round(back_odds, 2), back_stake, back_stake
         return result
 
@@ -467,17 +475,23 @@ class ExchangeBot:
                 log.info("  %s, retry %d/%d in 1 s", exc.reason, attempt, SUSPEND_RETRIES - 1)
                 await self._page.wait_for_timeout(1000)
 
-    async def _check_balance(self, needed: float, price: float | None) -> None:
-        """INSUFFICIENT_BALANCE: never click when the balance can't cover the bet's worst-case loss.
-        A dry run carries on (nothing is placed) so the clicks can still be tested."""
+    async def _check_balance(self, needed: float, price: float | None) -> float:
+        """The share of the bet the balance covers (1.0 = all of it): never click for more than the balance can lose.
+        22 Nov SS's 'try 3.2 odds sco' found less than its stake left and was skipped; a share of at least
+        MIN_BALANCE_SHARE now goes in with what is there, less is INSUFFICIENT_BALANCE. A dry run carries on in full."""
         balance, _ = await self._balance()
         log.info("  balance %s, this bet can lose %g", balance, needed)
-        if balance is None or balance >= needed:
-            return
+        if balance is None or balance >= needed or needed <= 0:
+            return 1.0
         message = f"INSUFFICIENT_BALANCE: balance {balance:g} < {needed:g} needed"
-        if not self._s.dry_run:
+        if self._s.dry_run:
+            log.warning("  %s (dry run continues; a live run would cut the stake or skip)", message)
+            return 1.0
+        share = _balance_share(balance, needed)
+        if share is None:
             raise BetAborted("skipped", message, price)
-        log.warning("  %s (dry run continues; a live run would skip)", message)
+        log.warning("  %s: placed with %.0f%% of its stake, what the balance covers", message, share * 100)
+        return share
 
     async def _place_exit(self, sig: BetSignal, pos: Position) -> BetResult:
         """Book the trade at the tipster's price: an equal-profit opposite bet that waits (unmatched) until
@@ -546,6 +560,16 @@ class ExchangeBot:
         status, reason = await _wait_for_outcome(page)
         status, reason = await self._confirm_by_balance(status, reason, before)
         await self._screenshot(sig, f"cashout-{status}")
+        if status == "failed" and _rate_over(reason):
+            # 22 Nov 13:00: the Cashout of a back on BH laid BH at 20+ and the site takes no bet above 10 odds.
+            # Backing the other runner (at about 1.05) books the same, so the loss cut / bookset still goes in.
+            log.info("  cashout %+g refused (%s): booking by hand on the other runner instead", pl, reason)
+            with contextlib.suppress(PlaywrightTimeout):  # the confirm stays open after the refusal (22 Nov screenshot)
+                cancel = page.locator(sel.CASHOUT_CANCEL).filter(visible=True).first
+                if await cancel.count():
+                    await cancel.click(timeout=3000)
+            await self._clear_toasts()
+            return await self._hedge_now(sig, name, pos, require_green)
         if status == "failed" and _retryable(reason):  # e.g. "Your bet is still on going."
             raise BetAborted("retry", f"cashout {pl:+g} refused for now: {reason}")
         return BetResult(status, f"cashout {pl:g}: {reason}", pl=pl)
@@ -568,14 +592,18 @@ class ExchangeBot:
             win, lose = book(pos.side, pos.stake, pos.price)  # dry run: the trade was never really placed
         side = "lay" if win > lose else "back"
 
+        limit = self._s.max_back_odds
         try:
-            cell, price = await self._odds_box_when_open(name, side)
+            # with a limit the row is read even without a price: the site may show none above it
+            cell, price = await self._odds_box_when_open(name, side, need_price=not limit)
         except BetAborted as exc:
             if exc.status == "skipped":  # suspended / no price for now: try again
                 raise BetAborted("retry", exc.reason) from exc
             raise
-        if side == "back" and self._s.max_back_odds and price and price > self._s.max_back_odds:
-            return await self._hedge_back_as_lay(sig, win, lose, require_green)
+        if limit and (price is None or price > limit):  # the site takes no bet above it: book on the other runner
+            if side == "back":
+                return await self._hedge_back_as_lay(sig, win, lose, require_green)
+            return await self._hedge_lay_as_back(sig, win, lose, require_green)
         slip = await self._open_slip(cell)
         await self._set_unmatch(slip, False)  # take the price on offer now
         price = _to_float(await slip.locator(sel.ODDS_INPUT).input_value()) or price
@@ -624,6 +652,38 @@ class ExchangeBot:
         result.pl = locked
         result.reason = (f"booked by hand (lay {other} {result.stake:g} @ {lay_price:g} = back {name} @ "
                          f"{back_odds:.2f}, locks {locked:+g}): {result.reason}")
+        return result
+
+    async def _hedge_lay_as_back(self, sig: BetSignal, win: float, lose: float, require_green: bool) -> BetResult:
+        """Booking needs a lay above MAX_BACK_ODDS (a back trade whose runner drifted): the site takes no bet above it,
+        its Cashout included ('Rate over 10', 22 Nov BH's loss cut at 13:00 with BH at 20+). Back the other runner
+        instead: stake (win - lose) / b pays win - stake on every result, as the lay would have."""
+        name = self._row_name
+        other = await self._other_runner()
+        if other is None:
+            raise BetAborted("failed", f"booking needs a lay on {name} above MAX_BACK_ODDS and this market has "
+                                       f"more than two runners: book it by hand")
+        try:
+            cell, back_price = await self._odds_box_when_open(other, "back")
+        except BetAborted as exc:
+            if exc.status == "skipped":
+                raise BetAborted("retry", exc.reason) from exc
+            raise
+        slip = await self._open_slip(cell)
+        await self._set_unmatch(slip, False)
+        back_price = _to_float(await slip.locator(sel.ODDS_INPUT).input_value()) or back_price
+        stake, locked = hedge_on_other(win, lose, back_price)
+        log.info("  book by hand: lay %s is above %g -> back %s %g @ %g locks %+g on every result",
+                 name, self._s.max_back_odds, other, stake, back_price, locked)
+        if require_green and locked < 0 and not self._s.dry_run:
+            raise BetAborted("retry", f"booking now would lock {locked:+g}; waiting for it to turn green")
+        back_sig = sig.model_copy(update={"side": "back", "selection": other})
+        result = await self._submit(back_sig, slip, stake, stake, back_price, hedge=True)
+        if result.status == "failed" and _retryable(result.reason):
+            raise BetAborted("retry", f"booking refused for now: {result.reason}")
+        result.pl = locked
+        result.reason = (f"booked by hand (back {other} {result.stake:g} @ {back_price:g} = lay {name} @ "
+                         f"{back_price / (back_price - 1):.2f}, locks {locked:+g}): {result.reason}")
         return result
 
     async def _site_book(self) -> tuple[float | None, list[float]]:
@@ -769,14 +829,57 @@ class ExchangeBot:
                                        f"site ({' / '.join(names[i] for i in found.values())}): not sure which "
                                        f"is meant, nothing placed")
         name, index = next(iter(found.items()))
-        log.info("  site match: %s%s", names[index], f" (found by the rules' spelling '{name}')"
-                 if name != selection else "")
-        self._match_name = names[index].strip()
-        await rows.nth(index).locator(sel.EVENT_NAME).click()
+        # 22 Nov 'Gg back 4.2' opened 'Gulf Giants v MI Emirates' of 24 Nov (suspended until then) for 12 minutes while
+        # 'Sharjah Warriors v Gulf Giants' was being played: when the team is in more than one listed match, a match
+        # whose page says it starts later than MATCH_AHEAD is a later fixture, and the team's other match is opened.
+        order = list(dict.fromkeys([names[index]] + [names[i] for i in _team_matches(names, name)]))
+        later: dict[str, datetime] = {}
+        entered = False
+        for k, match in enumerate(order):
+            if not await self._enter_listed(match, reload=k > 0):
+                continue
+            entered = True
+            log.info("  site match: %s%s", match, f" (found by the rules' spelling '{name}')" if name != selection else "")
+            start = await self._match_start() if len(order) > 1 else None
+            if start is None or start - datetime.now() <= MATCH_AHEAD:
+                return name
+            later[match] = start
+            log.info("  %s starts %s: a later fixture of %s, so its other listed match is tried", match,
+                     f"{start:%d %b %H:%M}", name)
+        if not entered:
+            raise BetAborted("failed", f"match not found on site: {names[index]} left the list")
+        first = min(later, key=later.get)  # every listed match of the team starts later: the first of them
+        if first.strip() != self._match_name and await self._enter_listed(first, reload=True):
+            log.info("  site match: %s (the first listed match of %s)", first, name)
+        return name
+
+    async def _enter_listed(self, match: str, reload: bool) -> bool:
+        """Opens the page of the listed match of this name (the list loaded again first when reload); False when the
+        list doesn't have it."""
+        page = self._page
+        if reload:
+            await self._open_list()
+        rows = page.locator(sel.EVENT_ROW)
+        names = await rows.locator(sel.EVENT_NAME).all_inner_texts()
+        if match not in names:
+            return False
+        self._match_name = match.strip()
+        await rows.nth(names.index(match)).locator(sel.EVENT_NAME).click()
         await page.wait_for_url(sel.MATCH_URL, timeout=15000)
         await page.locator(sel.RUNNER_ROW).first.wait_for(timeout=15000)
         await self._dismiss_popups()
-        return name
+        return True
+
+    async def _match_start(self) -> datetime | None:
+        """When the open match starts, from its page header ('Gulf Giants v MI Emirates (Nov 24, 8:00 PM)'); None when
+        the page doesn't show it."""
+        try:
+            box = self._page.get_by_text(MATCH_TIME).first
+            if not await box.count():
+                return None
+            return _parse_match_start(await box.inner_text(timeout=3000), datetime.now())
+        except Exception:  # the check must never stop a bet: without it the match is used as before
+            return None
 
     async def _found_by_ai(self, names: list[str], event_name: str, tried: list[str]) -> dict[str, int]:
         """A one-word name the list doesn't have (first name 'Tallon', code 'pkr'): the AI picks the listed side it
@@ -1075,6 +1178,59 @@ def _initials_fit(name: str, side: str) -> bool:
     first name must begin with it ('Tallon', 'Han'). Longer first words ('Pokhara Avengers') aren't checked."""
     words = [w for w in re.split(r"[^a-z]+", side.lower()) if w]
     return len(words) < 2 or len(words[0]) > 3 or name.lower().startswith(words[0])
+
+
+MIN_BALANCE_SHARE = 0.25  # a bet the balance covers less of than this is skipped (INSUFFICIENT_BALANCE)
+
+
+def _balance_share(balance: float, needed: float) -> float | None:
+    """The share of a bet risking `needed` that `balance` can cover, keeping 2% aside; None below MIN_BALANCE_SHARE."""
+    share = int(balance * 0.98) / needed if needed > 0 else 1.0
+    return round(min(share, 1.0), 4) if share >= MIN_BALANCE_SHARE else None
+
+
+def _cut_stake(decision, share: float):
+    """The entry decision with its stake cut to `share` of it (whole rupees), its liability in proportion."""
+    stake = float(int(decision.stake * share))
+    risk = round(decision.liability * stake / decision.stake, 2) if decision.stake else 0.0
+    return replace(decision, stake=stake, liability=risk)
+
+
+def hedge_on_other(win: float, lose: float, back_price: float) -> tuple[float, float]:
+    """(stake, locked P/L) of a back on the other runner of two that books a trade paying `win` if its runner wins and
+    `lose` if it loses (win > lose): stake (win - lose) / b leaves win - stake on both results."""
+    stake = round((win - lose) / back_price, 2)
+    return stake, round(win - stake, 2)
+
+
+def _rate_over(reason: str) -> bool:
+    """The site refused a bet for its price: it takes none above 10 odds, backs, lays and its own Cashout alike
+    ('Bet Not Accepted. Rate over 10.', 22 Nov BH's loss cut with BH at 20+)."""
+    return "rate over" in (reason or "").lower()
+
+
+MATCH_AHEAD = timedelta(hours=12)  # a listed match starting later than this is not the one a live tip is about
+MATCH_TIME = re.compile(r"\(\s*([A-Z][a-z]{2})\s+(\d{1,2}),\s*(\d{1,2}):(\d{2})\s*([AP]M)\s*\)")
+
+
+def _parse_match_start(text: str, now: datetime) -> datetime | None:
+    """'(Nov 24, 8:00 PM)' -> 24 Nov 20:00 of this year (next year when that would be long past)."""
+    m = MATCH_TIME.search(text or "")
+    if not m:
+        return None
+    try:
+        start = datetime.strptime(f"{m[1]} {m[2]} {now.year} {m[3]}:{m[4]} {m[5]}", "%b %d %Y %I:%M %p")
+    except ValueError:
+        return None
+    return start.replace(year=now.year + 1) if start < now - timedelta(days=180) else start
+
+
+def _team_matches(names: list[str], team: str) -> list[int]:
+    """The listed matches the team plays in (a team plays the same league's matches every few days)."""
+    if not team.strip(" ?"):
+        return []
+    return [i for i, n in enumerate(names)
+            if any(contains_player(team, side) or code_fits(team, side) for side in _sides(n))]
 
 
 def _best_index(names: list[str], target: str, selection: str = "") -> int | None:
