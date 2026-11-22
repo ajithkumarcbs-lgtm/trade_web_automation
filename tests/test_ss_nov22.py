@@ -9,8 +9,8 @@ from conftest import make_settings, signal
 from test_channels_rules import make, msg
 from tradebot import exchange_bot, site_selectors as sel
 from tradebot.channels import Profile
-from tradebot.exchange_bot import (BetAborted, BetResult, ExchangeBot, _balance_share, _cut_stake, _parse_match_start,
-                                   _rate_over, _team_matches, hedge_on_other)
+from tradebot.exchange_bot import (BetAborted, BetResult, ExchangeBot, _balance_share, _best_index, _cut_stake,
+                                   _parse_match_start, _rate_over, _team_matches, hedge_on_other)
 from tradebot.risk import Decision, RiskManager
 
 LISTED = ["Desert Vipers v Abu Dhabi Knight Riders", "Gulf Giants v MI Emirates", "Sharjah Warriors v Gulf Giants"]
@@ -63,7 +63,7 @@ class ListPage:
         return list(self.names)
 
 
-def open_match(store, starts, listed=LISTED, selection="Gulf Giants", event="Gulf Giants v ?"):
+def open_match(store, starts, listed=LISTED, selection="Gulf Giants", event="Gulf Giants v ?", aka="gg"):
     """Runs _open_match on the list with each match page saying it starts at starts[match] (None: no time shown)."""
     bot = bot_for(store)
     bot._page = ListPage(listed)
@@ -82,8 +82,20 @@ def open_match(store, starts, listed=LISTED, selection="Gulf Giants", event="Gul
         return starts.get(bot._match_name)
 
     bot._open_list, bot._enter_listed, bot._match_start = nothing, enter, start
-    name = asyncio.run(bot._open_match(event, selection, "gg"))
+    name = asyncio.run(bot._open_match(event, selection, aka))
     return bot, opened, name
+
+
+def test_a_code_for_one_team_in_two_listed_matches_needs_no_ai(store):
+    """22 Nov 21:06 '3.1 odds back dc limit 0.5': 'dc' fitted Dubai Capitals in two listed matches, so the AI was asked
+    which (4.4 s of the 7.3 s to the click). One team is no guess: its match being played is opened at once."""
+    later, live = "Dubai Capitals v Desert Vipers", "Dubai Capitals v Abu Dhabi Knight Riders"
+    listed = [later, "Gulf Giants v MI Emirates", live]
+    assert _best_index(listed, "DC", "DC") == 0
+    assert _best_index(listed + ["Delhi Capitals v Mumbai Indians"], "DC", "DC") is None  # two teams: the AI says
+    bot, opened, _ = open_match(store, {later: datetime.now() + timedelta(days=3)}, listed=listed, selection="DC",
+                                event="DC v ?", aka="")
+    assert opened == [later, live] and bot._match_name == live
 
 
 def test_a_tip_on_a_team_with_a_later_fixture_listed_opens_the_match_being_played(store):

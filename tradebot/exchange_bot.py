@@ -1255,10 +1255,14 @@ def _best_index(names: list[str], target: str, selection: str = "") -> int | Non
         # A team code the tipster made up ('af' = Amsterdam Flames), or a player's first name ('Tallon' in
         # 'Tallon Griekspoor v Brandon Nakashima'): the one listed match with a side it fits. Two candidates
         # ('af' = Afghanistan too) is a guess, so none.
-        fits = [i for i, n in enumerate(names)
-                if any(code_fits(must_have, side) or (_first_name_of(must_have, side)
-                                                      and _initial_fits(must_have, initial, side)) for side in _sides(n))]
-        return fits[0] if len(fits) == 1 else None
+        def fitting(side: str) -> bool:
+            return code_fits(must_have, side) or (_first_name_of(must_have, side) and _initial_fits(must_have, initial, side))
+
+        fits = [i for i, n in enumerate(names) if any(fitting(side) for side in _sides(n))]
+        # One team in several listed matches (a league plays every few days) is no guess: SS's 'dc' on 22 Nov fitted
+        # Dubai Capitals twice and waited 4.4 s for the AI. Its first listed match; _open_match takes the one being played.
+        teams = {side.strip().lower() for i in fits for side in _sides(names[i]) if fitting(side)}
+        return fits[0] if fits and len(teams) == 1 else None
     if not scores:
         return None
     best, _, index = max(scores)
