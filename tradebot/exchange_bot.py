@@ -204,6 +204,8 @@ class ExchangeBot:
                 status = exc.status
                 if sig.action != "close" and status in ("failed", "skipped") and _entry_retryable(exc.reason):
                     status = "retry"  # passes by itself: the caller tries again
+                if sig.action == "close" and status == "skipped" and _retryable(exc.reason):
+                    status = "retry"  # a loss cut / bookset on a suspended market is tried again in seconds, never dropped
                 shot = None
                 if status == "failed" or (status == "retry" and sig.key() not in self._saved_for):
                     self._saved_for.add(sig.key())  # one saved page per instruction, not one per retry

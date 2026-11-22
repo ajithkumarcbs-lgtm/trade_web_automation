@@ -269,6 +269,22 @@ def test_a_cashout_refused_for_its_rate_books_by_hand_instead(store, monkeypatch
     assert (result.status, result.pl) == ("placed", -847.62)
 
 
+def test_a_loss_cut_on_a_suspended_market_is_retried_not_dropped(store):
+    """Booking by hand reads the runner's row first; a suspended market there came back 'skipped', which drops a close."""
+    bot = bot_for(store)
+    bot._page, bot._page_since = ListPage([]), datetime.now()
+
+    async def suspended(sig, pos, require_green=False):
+        raise BetAborted("skipped", "market suspended")
+
+    async def page_saved(sig, tag):
+        return None
+
+    bot._cash_out, bot._save_page, bot._close_slip, bot._park = suspended, page_saved, nothing, nothing
+    result = asyncio.run(bot.place(signal(action="close", odds=None, loss_cut=True, **BH), None))
+    assert result.status == "retry"
+
+
 def hedge_bot(store, lay_price):
     bot = bot_for(store, max_back_odds=10)  # MAX_BACK_ODDS=10 on the server
     called = []
