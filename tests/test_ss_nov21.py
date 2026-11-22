@@ -311,6 +311,85 @@ def test_a_waiting_entry_of_a_channel_now_paper_only_is_dropped_not_placed(store
     assert site.calls == [] and store.pending_instructions("live") == []
 
 
+# --- 22 Nov: SS's real messages replayed through the current code (scratchpad replay_live.py) -----------------------
+
+@pytest.mark.parametrize("text,name,odds,units", [
+    ("Aa 4.1 odds back 0.5 limit", "aa", 4.1, 0.5),          # 7 Nov: the AI wrote 'Unknown', the rules knew no such order
+    ("Rock 3.8 odds 0.5 limit", "rock", 3.8, 0.5),           # 11 Nov, second channel
+    ("Hong Kong 8 odds back 0.5 limit", "hong kong", 8.0, 0.5),
+    ("3.7 odds back stty0.5 limit", "stty", 3.7, 0.5),       # 8 Nov: name glued to the stake
+    ("4.7 odds back ut limit 0.5", "ut", 4.7, 0.5),          # as before
+    ("Mlr back 3.3 odds limit 1", "mlr", 3.3, 1.0),
+])
+def test_sss_other_entry_orders_are_read_by_the_rules(text, name, odds, units):
+    from tradebot.rules import parse_known
+    sig = parse_known(text, "ss")[0]
+    assert (sig.action, sig.selection, sig.odds, sig.units) == ("entry", name, odds, units)
+
+
+def test_a_short_name_glued_to_the_stake_still_names_the_team():
+    from main import _mentions
+    assert _mentions("3.7 odds back stty0.5 limit", "Sydney Thunder", {"stty": "Sydney Thunder"})
+
+
+SL = dict(selection="Sri Lanka", event="England v Sri Lanka", sport="cricket")
+
+
+def test_a_stake_in_the_same_message_sizes_the_add(store):
+    """22 Oct '50 odds sl back rs 400 or rs 500 only', read as an add with no stake plus a stake of Rs 400: the add went in
+    at a whole limit and the stake was dropped. Now the add takes it: Rs 400 of SS's Rs 1,500 limit = 0.27 limit."""
+    script = {"7.6 odds sl back limit 0.5": [signal(odds=7.6, units=0.5, **SL)],
+              "50 odds sl back rs 400 or rs 500 only": [signal(action="add", odds=50.0, units=None, **SL),
+                                                        signal(action="stake", odds=None, units=None, amount=400, **SL)]}
+    pipe, site, _ = make(store, Profile("ss", rupees_per_unit=1500), script, live=7.6, max_odds=1000)
+
+    async def go():
+        await pipe._handle(msg("7.6 odds sl back limit 0.5"))
+        site.live = 50.0
+        await pipe._handle(msg("50 odds sl back rs 400 or rs 500 only"))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "Sri Lanka", 0.5), ("entry", "Sri Lanka", 270)]
+
+
+HBH = dict(selection="Hobart Hurricanes", event="Hobart Hurricanes v Melbourne Renegades", sport="cricket")
+
+
+def test_a_text_part_exit_books_and_keeps_the_rest(store):
+    """4 Nov '0.5 limit exit now' on SS's 1-limit Hobart trade, read as EXIT 0.5u without a price and skipped."""
+    script = {"4 odds back hbh limit 1 only": [signal(odds=4.0, units=1, **HBH)],
+              "0.5 limit exit now": [signal(action="exit", odds=None, units=0.5, **HBH)]}
+    pipe, site, _ = make(store, Profile("ss"), script, live=4.0)
+
+    async def go():
+        await pipe._handle(msg("4 odds back hbh limit 1 only"))
+        site.live = 3.2
+        await pipe._handle(msg("0.5 limit exit now"))
+
+    asyncio.run(go())
+    assert [call[0] for call in site.calls] == ["entry", "close", "entry"]
+    assert site.calls[-1][2] == 625  # half of 1000 @ 4.0, back in at 3.2: 0.5 x 1000 x 4.0 / 3.2
+    assert store.find_position("Hobart Hurricanes", "live").stake == 625
+
+
+def test_an_add_without_a_price_goes_in_at_the_price_on_offer(store):
+    """22 Oct 'Add one more 1 limit' three minutes after India at 4.70: India was 4.23, and the add was refused as 10% below
+    the trade's price. An add with no price of its own is what SS did there and then."""
+    ind = dict(selection="India", event="New Zealand v India", sport="cricket")
+    script = {"4.7 odds ind back limit 1": [signal(odds=4.7, units=1, **ind)],
+              "Add one more 1 limit": [signal(action="add", odds=None, units=1, **ind)]}
+    pipe, site, _ = make(store, Profile("ss"), script, live=4.7)
+
+    async def go():
+        await pipe._handle(msg("4.7 odds ind back limit 1"))
+        site.live = 4.23
+        await pipe._handle(msg("Add one more 1 limit"))
+
+    asyncio.run(go())
+    assert site.calls == [("entry", "India", 1), ("entry", "India", 1000)]
+    assert store.find_position("India", "live").stake == 2000
+
+
 class HungSite(FakeSite):
     async def place(self, sig, position, require_green=False):
         self.calls.append((sig.action, sig.selection, sig.amount or sig.units))

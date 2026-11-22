@@ -84,6 +84,8 @@ class BetSignal(AISignal):
     # A close that keeps part of the trade (SS's voice '0.5 limit exit, 0.5 hold'): the site's Cashout books the whole
     # trade, then this share of it goes back in at once, sized to pay as that share of the old trade would.
     keep_share: float | None = None
+    # A text part exit ('0.5 limit exit now', SS 4 Nov): this many limits go; the share kept is worked out from the trade
+    exit_units: float | None = None
 
     def key(self) -> str:
         """Normalised identity used to spot the same tip posted twice."""
@@ -91,6 +93,8 @@ class BetSignal(AISignal):
                  str(self.line or ""), str(self.odds or "")]
         if self.keep_share:  # a part exit is no duplicate of the bookset of the part kept
             parts.append(f"keep {self.keep_share:g}")
+        if self.exit_units:
+            parts.append(f"exit {self.exit_units:g}")
         return "|".join(re.sub(r"[^a-z0-9.]+", " ", p.lower()).strip() for p in parts)
 
     def describe(self) -> str:
@@ -99,6 +103,8 @@ class BetSignal(AISignal):
             kind = "LOSS CUT" if self.loss_cut else "BOOKSET"
             if self.keep_share:
                 kind = f"PART EXIT, {self.keep_share:.0%} kept"
+            elif self.exit_units:
+                kind = f"PART EXIT, {self.exit_units:g} limit out"
             return f"{source}CLOSE ({kind}) {self.selection} [{self.market}] {self.event}"
         if self.action == "cancel":
             return f"{source}CANCEL waiting bets on {self.selection}"

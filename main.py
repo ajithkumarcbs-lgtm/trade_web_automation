@@ -234,8 +234,28 @@ def _mentions(text: str, name: str, aliases: dict[str, str]) -> bool:
     name ('kg', 'wi', 'war')?"""
     if not name.strip(" ?"):
         return True
+    text = GLUED.sub(r"\1 \2", text or "")  # SS 8 Nov '3.7 odds back stty0.5 limit': the short name glued to the stake
     expanded = " ".join(expand_team(word) for word in apply_aliases(text, aliases).split())
     return contains_player(name, expanded) or any(same_name(word, name) for word in name_words(text))
+
+
+GLUED = re.compile(r"([A-Za-z])(\d)")
+# SS's text part exit, '0.5 limit exit now' (4 Nov): that many limits out now, the rest kept
+TEXT_PART_EXIT = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:limit|lmt)s?\s*(?:exit|remove|out|book\W*set)\b", re.IGNORECASE)
+
+
+def _merge_stake(signals: list[BetSignal]) -> list[BetSignal]:
+    """One message read as an entry / add with no stake plus a separate stake ('50 odds sl back rs 400 or rs 500 only',
+    SS 22 Oct): the stake belongs to that entry. Left alone, the add went in at a whole limit and the stake was dropped
+    ('no entry in the last 180s to top up') - 4-5 times what SS said, on a 50-odds long shot."""
+    stakes = [s for s in signals if s.action == "stake" and (s.units or s.amount or s.green_pct)]
+    moves = [s for s in signals if s.action in ("entry", "add") and s.units is None and s.amount is None]
+    if len(stakes) != 1 or len(moves) != 1:
+        return signals
+    stake, move = stakes[0], moves[0]
+    merged = move.model_copy(update={"units": stake.units, "amount": stake.amount,
+                                     **({"green_pct": stake.green_pct} if stake.green_pct else {})})
+    return [merged if s is move else s for s in signals if s is not stake]
 
 
 SURE_WINNER, SURE_LOSER = 1.10, 11.0  # a runner's last price before its market closed: it had (nearly) won / lost
@@ -481,6 +501,7 @@ class Pipeline:
             signals = [sig for sig in signals if sig.action == "close"]
             log.info("  msg %s came %.0fs late: only its closes act%s", msg.id, age,
                      f" ({len(others)} other instruction(s) not taken)" if others else "")
+        signals = _merge_stake(signals)
 
         for sig in signals:
             await self._act(sig, msg.text, channel, how, message_id)
@@ -584,6 +605,12 @@ class Pipeline:
                                     and VOICE_CLOSE_NOW.search(msg.text) and not VOICE_NOT_NOW.search(msg.text)):
                 log.info("  voice note: no action on %s (%.2f): %r", sig.describe(), sig.confidence, msg.text[:100])
                 continue
+            elif (not msg.voice and sig.action in ("exit", "close") and not sig.odds and sig.market == "match_odds"
+                    and (part := TEXT_PART_EXIT.search(msg.text or "")) and not not_yet(msg.text)):
+                # SS 4 Nov '0.5 limit exit now' (read as EXIT 0.5u without a price, so skipped): that much out now
+                log.info("  part exit now: %s limit out of the trade: %r", part.group(1), msg.text[:80])
+                sig = sig.model_copy(update={"action": "close", "loss_cut": True, "exit_units": float(part.group(1)),
+                                             "odds": None, "units": None, "amount": None, "when_odds": None})
             if (sig.action == "entry" and how == "ai-only" and profile.entry_words and msg.image is None
                     and not re.search(profile.entry_words, msg.text, re.IGNORECASE)):
                 log.info("  not an entry: %r has none of the entry words of %s", msg.text[:60], channel.name)
@@ -607,7 +634,7 @@ class Pipeline:
             if sig.action == "close" and not msg.voice and not_yet(msg.text):
                 log.info("  not a close yet: %r", msg.text[:60])
                 continue
-            if sig.action == "close" and not sig.keep_share:  # a part exit leaves a trade for the next bookset to book
+            if sig.action == "close" and not (sig.keep_share or sig.exit_units):  # a part exit leaves a trade to book
                 unnamed = not sig.selection.strip(" ?") or (
                     not _mentions(msg.text, sig.selection, profile.aliases)
                     and not _mentions(msg.reply_to, sig.selection, profile.aliases))
@@ -967,7 +994,9 @@ class Pipeline:
         s = self._risk.cfg(pos)
         if sig.confidence < s.min_confidence:  # SS 1 Nov: '3.7' alone, read as one more add at 0.40
             return await skip(f"AI confidence {sig.confidence:.2f} below {s.min_confidence}")
-        odds = sig.odds or pos.price
+        # 'Add one more 1 limit' gives no price: it goes in at the price on offer, as the tipster's own add did. Checked
+        # against the trade's price it was refused (SS 22 Oct: 4.70 then, 4.23 three minutes later, -10%).
+        odds = sig.odds
         extra = sig.amount if sig.amount else (sig.units or 1) * s.unit_stake
         if sig.side and sig.side != pos.side:
             price = await self._price_on_trade(pos, sig) if sig.side == "lay" and sig.odds else None
@@ -1052,8 +1081,13 @@ class Pipeline:
                 return result
             check = self._risk.precheck(sig)
             s = self._risk.cfg(sig)
-            if sig.action == "close" and sig.keep_share and check.ok and check.position:
-                self._keep_after_close[check.position.id] = sig.keep_share
+            if sig.action == "close" and check.ok and check.position:
+                share = sig.keep_share
+                if share is None and sig.exit_units:  # '0.5 limit exit now' on a 1-limit trade: half of it is kept
+                    held = check.position.stake / (check.position.unit or s.unit_stake)
+                    share = round(1 - sig.exit_units / held, 4) if held > sig.exit_units + 0.01 else None
+                if share:
+                    self._keep_after_close[check.position.id] = share
             if not check.ok:
                 result = BetResult("skipped", check.reason)
             elif self._bot is None:

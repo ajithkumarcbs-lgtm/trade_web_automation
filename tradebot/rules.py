@@ -87,12 +87,15 @@ TIPSTER_ENTRIES = [
     rf"^back {NAME} {UNITS} ?units?$",  # Back preston 1 unit
     rf"^{NAME} back {UNITS} ?units?$",  # Bondar back 1 unit
 ]
+# the stake after an SS entry: 'limit 1' or, as SS also writes, '0.5 limit' ('Aa 4.1 odds back 0.5 limit', 7 Nov)
+SS_SIZE = rf"(?: (?:limit {UNITS}|{UNITS.replace('units', 'units2')} limit))?(?: only)?"
 SS_ENTRIES = [
-    rf"^(?:ready )?(?:now )?{ODDS} ?odds? back {NAME}(?: limit {UNITS})?(?: only)?$",  # 6 odds back war limit 1
-    rf"^{ODDS} ?odds? {NAME} back(?: limit {UNITS})?(?: only)?$",  # 3.15 odds pak back
-    rf"^{NAME} back {ODDS} ?odds?(?: limit {UNITS})?$",  # Sl back 5.7 odds limit 2
-    rf"^{NAME} {ODDS} ?odds? back(?: limit {UNITS})?(?: only)?$",  # Wi 3.85 odds back, Lim 5 odds back limit 1
+    rf"^(?:ready )?(?:now )?{ODDS} ?odds? back {NAME}{SS_SIZE}$",  # 6 odds back war limit 1, 3.7 odds back stty 0.5 limit
+    rf"^{ODDS} ?odds? {NAME} back{SS_SIZE}$",  # 3.15 odds pak back
+    rf"^{NAME} back {ODDS} ?odds?{SS_SIZE}$",  # Sl back 5.7 odds limit 2
+    rf"^{NAME} {ODDS} ?odds? back{SS_SIZE}$",  # Wi 3.85 odds back, Aa 4.1 odds back 0.5 limit, Hong Kong 8 odds back
     rf"^{ODDS} ?odds? {NAME} limit {UNITS}(?: only)?$",  # 3.6 odds hob limit 1 only
+    rf"^{NAME} {ODDS} ?odds? (?:limit {UNITS}|{UNITS.replace('units', 'units2')} limit)(?: only)?$",  # Rock 3.8 odds 0.5 limit
 ]
 SS_STAKES = [
     rf"^(?:limit|limi|limt) {UNITS}(?: (?:only|use|enough))*$",  # Limit 2, Limit 1.5 use
@@ -249,6 +252,8 @@ def parse_known(text: str, rules: str, reply_to: str = "") -> list[BetSignal] | 
             player = re.sub(r"[^A-Za-z .'-]", "", name["name"]).strip().title()
             return [_signal("entry", player, "back", round(1 + wins / units, 2), units)]
     line = normalise(text)
+    if rules == "ss":  # '3.7 odds back stty0.5 limit' (8 Nov): the short name glued to the stake
+        line = re.sub(r"([a-z])(\d)", r"\1 \2", line)
     if not line or len(line.split()) > 10:
         return None
     entries = {"tipster": TIPSTER_ENTRIES, "ss": SS_ENTRIES}.get(rules, [])
@@ -258,7 +263,8 @@ def parse_known(text: str, rules: str, reply_to: str = "") -> list[BetSignal] | 
             if name in NOT_NAMES or any(w in NOT_NAMES for w in name.split()):
                 return None  # a nickname or filler word: the AI knows who is meant
             odds = float(m["odds"]) if m.groupdict().get("odds") else None
-            return [_signal("entry", name, "back", odds, _units(m.groupdict().get("units")))]
+            units = _units(m.groupdict().get("units") or m.groupdict().get("units2"))
+            return [_signal("entry", name, "back", odds, units)]
     if rules == "david":
         for pattern in DAVID_ENTRIES:
             if m := re.match(pattern, line):
