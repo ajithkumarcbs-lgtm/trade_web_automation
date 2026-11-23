@@ -1170,6 +1170,25 @@ def _slug(sig: BetSignal) -> str:
     return re.sub(r"[^a-z0-9]+", "-", sig.selection.lower()).strip("-")[:40]
 
 
+SQUAD_WORDS = {"a": {"a"}, "w": {"w", "women", "womens"}, "women": {"w", "women", "womens"}}
+
+
+def code_and_squad(name: str) -> tuple[str, set[str]]:
+    """A tip's team code and squad word: 'Ban a' -> ('ban', {'a'}), 'bh w' -> ('bh', women's words); else (name, {})."""
+    words = name.lower().split()
+    if len(words) == 2 and words[1] in SQUAD_WORDS and words[0].isalpha() and 2 <= len(words[0]) <= 4:
+        return words[0], SQUAD_WORDS[words[1]]
+    return name, set()
+
+
+def without_squad(side: str, squad: set[str]) -> str | None:
+    """The listed side without its squad word ('Bangladesh A' -> 'Bangladesh'), None when it isn't of that squad."""
+    words = side.split()
+    if len(words) >= 2 and words[-1].lower() in squad:
+        return " ".join(words[:-1])
+    return None
+
+
 def _first_name_of(name: str, listed: str) -> bool:
     """A single name the tipster gave ('Tallon', 'Dayana') is the first name of this listed player."""
     word = name.strip().lower()
@@ -1255,7 +1274,12 @@ def _best_index(names: list[str], target: str, selection: str = "") -> int | Non
         # A team code the tipster made up ('af' = Amsterdam Flames), or a player's first name ('Tallon' in
         # 'Tallon Griekspoor v Brandon Nakashima'): the one listed match with a side it fits. Two candidates
         # ('af' = Afghanistan too) is a guess, so none.
+        code, squad = code_and_squad(must_have)
+
         def fitting(side: str) -> bool:
+            if squad:  # 'Ban a' / 'bh w': the code, on a side of that squad ('Bangladesh A', 'Brisbane Heat W')
+                base = without_squad(side, squad)
+                return base is not None and code_fits(code, base)
             return code_fits(must_have, side) or (_first_name_of(must_have, side) and _initial_fits(must_have, initial, side))
 
         fits = [i for i, n in enumerate(names) if any(fitting(side) for side in _sides(n))]

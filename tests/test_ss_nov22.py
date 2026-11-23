@@ -300,6 +300,57 @@ def test_a_team_before_a_bookset_is_still_its_name():
     assert parse_known("Eng losscut now", "ss")[0].selection == "eng"
 
 
+# --- 23 Nov: short names ('Ban a', 'sw') ------------------------------------------------------------------------
+
+A_SIDES = ["Zimbabwe A v Ireland A", "Sri Lanka A v Bangladesh A", "Sharjah Warriors v Desert Vipers",
+           "Scotland Women v Zimbabwe Women"]
+
+
+def test_an_a_side_is_judged_by_its_name_not_by_the_a():
+    """23 Nov 16:27 '3.4 odds back ban limit 0.5': the AI's 'Ban a' was found in 'Zimbabwe A v Ireland A' by its 'a', the
+    rules' 'Bangladesh' in 'Sri Lanka A v Bangladesh A', and nothing was placed (two matches)."""
+    from tradebot.names import contains_player
+    assert not contains_player("Ban a", "Zimbabwe A v Ireland A")
+    assert contains_player("Bangladesh A", "Sri Lanka A v Bangladesh A")
+    assert _best_index(A_SIDES, "Ban a v sl a", "Ban a") == 1  # 'ban' on an A side: Bangladesh A
+    assert _best_index(A_SIDES, "Ban a v sl a", "Bangladesh") == 1
+    assert _best_index(["Brisbane Heat v Perth Scorchers", "Brisbane Heat W v Perth Scorchers W"], "bh w", "bh w") == 1
+
+
+def test_a_code_is_read_against_the_channels_own_match():
+    from main import is_code, side_for_code
+    match = "Sharjah Warriors v Desert Vipers"
+    assert side_for_code("sw", [match]) == ("Sharjah Warriors", match)
+    assert side_for_code("SW", [match, "Scotland Women v Zimbabwe Women"]) is None  # two teams fit: no guess
+    assert side_for_code("ban a", ["Sri Lanka A v Bangladesh A"]) == ("Bangladesh A", "Sri Lanka A v Bangladesh A")
+    assert is_code("sw") and is_code("Ban a") and not is_code("Desert Vipers") and not is_code("India")
+
+
+SW_DV = "Sharjah Warriors v Desert Vipers"
+
+
+def test_a_second_entry_in_the_same_match_finds_the_team_by_its_code(store):
+    """23 Nov: '3 odds back dv limit 0.5' (20:33), booked by 'Losscut' at 21:42 (+242.95), then '10 odds back sw green amount
+    only 15%' at 22:31: 'SW' was not found on the site for 5 minutes and the entry was missed."""
+    script = {"3 odds back dv limit 0.5": [signal(odds=3.0, units=0.5, selection="Desert Vipers", event=SW_DV,
+                                                  sport="cricket")],
+              "Losscut": [signal(action="close", odds=None, loss_cut=True, selection="Desert Vipers", event=SW_DV,
+                                 sport="cricket")],
+              "10 odds back sw green amount only 15%": [signal(odds=10.0, green_pct=15, selection="SW", event="SW v ?",
+                                                               sport="cricket")]}
+    pipe, site, _ = make(store, Profile("ss", rules="ss", green_money="stake"), script, live=3.0)
+
+    async def go():
+        await pipe._handle(msg("3 odds back dv limit 0.5"))
+        await pipe._handle(msg("Losscut"))
+        site.live = 10.0
+        await pipe._handle(msg("10 odds back sw green amount only 15%"))
+
+    asyncio.run(go())
+    assert site.calls[-1] == ("entry", "Sharjah Warriors", 37.5)  # 15% of the +250 booked
+    assert store.find_position("Sharjah Warriors", "live").event == SW_DV
+
+
 # --- the balance -------------------------------------------------------------------------------------------
 
 def test_a_short_balance_cuts_the_stake_instead_of_skipping():

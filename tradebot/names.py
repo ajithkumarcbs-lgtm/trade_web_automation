@@ -8,6 +8,9 @@ TYPO_MIN_LENGTH = 5  # only words this long may be misspelt ("nambia"); short on
 SAME_NAME_MIN = 70  # two readings of one message: 'beaz' / 'Baez' = 75, 'berriting' / 'Berrettini' = 74
 IGNORED_WORDS = {"v", "vs"}
 WOMEN = {"w", "women", "womens"}  # the site writes 'Melbourne Stars W', tips and the AI 'Stars W' / 'Stars Women'
+# An 'A' side ('Sri Lanka A v Bangladesh A'): SS 23 Nov '3.4 odds back ban' was read by the AI as 'Ban a', whose last word
+# 'a' was then found in 'Zimbabwe A v Ireland A'; with the rules' 'Bangladesh' in another match, nothing was placed.
+SQUADS = {"a"}
 # Different teams whose names look like typos of each other ('india' / 'indies' = 91): never matched loosely.
 CONFUSABLE = {frozenset(pair) for pair in (("india", "indies"), ("austria", "australia"), ("ireland", "iceland"))}
 
@@ -47,6 +50,10 @@ def contains_player(selection: str, listed: str) -> bool:
     listed_words = _words(listed)
     if len(words) >= 2 and words[-1] in WOMEN:
         if not WOMEN.intersection(listed_words):
+            return False
+        words = words[:-1]
+    elif len(words) >= 2 and words[-1] in SQUADS:  # 'Ban a': judged by 'ban', in a match of A sides
+        if words[-1] not in listed_words:
             return False
         words = words[:-1]
     key = words[-1]

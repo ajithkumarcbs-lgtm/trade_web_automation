@@ -27,7 +27,7 @@ from openai import APIConnectionError, RateLimitError
 
 from tradebot.channels import MANUAL, Channel, Channels, apply_aliases
 from tradebot.config import DATA_DIR, SITE_FIELDS, TELEGRAM_FIELDS, Settings, load_settings
-from tradebot.exchange_bot import BetResult, ExchangeBot, TeamQuote, _best_index
+from tradebot.exchange_bot import BetResult, ExchangeBot, TeamQuote, _best_index, code_and_squad, without_squad
 from tradebot.fancy import (PLAYER_KINDS, Cricbuzz, Match, Session, coming_match, finished_match, read_session, same_batter,
                             team_fits)
 from tradebot.fancy import settle as settle_session
@@ -38,7 +38,7 @@ from tradebot.models import BetSignal, ParsedMessage, as_bet
 from tradebot.notifier import (Notifier, bet_alert, confirm_request, day_report, match_finished, results_report,
                                trade_summary)
 from tradebot.risk import Decision, RiskManager, booked_profit, other_runners_price
-from tradebot.names import contains_player, same_name
+from tradebot.names import code_fits, contains_player, same_name
 from tradebot.rules import NOT_NAMES, fresh_part_of_paste, name_words, not_yet, parse_known, parse_strict, reconcile
 from tradebot.skyfair import is_skyfair
 from tradebot.signal_parser import CONTEXT_MESSAGES, CONTEXT_WINDOW, VOICE_HINT, context_line, expand_team, make_parser
@@ -249,6 +249,30 @@ def _mentions(text: str, name: str, aliases: dict[str, str]) -> bool:
     text = GLUED.sub(r"\1 \2", text or "")  # SS 8 Nov '3.7 odds back stty0.5 limit': the short name glued to the stake
     expanded = " ".join(expand_team(word) for word in apply_aliases(text, aliases).split())
     return contains_player(name, expanded) or any(same_name(word, name) for word in name_words(text))
+
+
+CONTEXT_MATCHES = timedelta(hours=12)  # a short team code is read against the matches the channel traded this recently
+
+
+def is_code(name: str) -> bool:
+    """A short team code ('sw', 'dv', 'Ban a', 'bh w'), not a full name."""
+    base, squad = code_and_squad(name)
+    words = (base if squad else name).strip().lower().split()
+    return len(words) == 1 and words[0].isalpha() and 2 <= len(words[0]) <= 4
+
+
+def side_for_code(code: str, events: list[str]) -> tuple[str, str] | None:
+    """The one team of the channel's recent matches a short code fits, with its match: SS 23 Nov '10 odds back sw green
+    amount only 15%', 50 minutes after the Desert Vipers trade in 'Sharjah Warriors v Desert Vipers' was booked, is
+    Sharjah Warriors. None when no team or more than one fits."""
+    base, squad = code_and_squad(code)
+    fits: dict[str, tuple[str, str]] = {}
+    for event in events:
+        for side in (s.strip() for s in re.split(r"\s+v\s+", event)):
+            name = without_squad(side, squad) if squad else side
+            if side.strip(" ?") and name and code_fits(base, name):
+                fits.setdefault(side.lower(), (side, event))
+    return next(iter(fits.values())) if len(fits) == 1 else None
 
 
 def _same_match(a: BetSignal, b: BetSignal) -> bool:
@@ -831,6 +855,13 @@ class Pipeline:
             names["selection"] = re.sub(r"^(\S{3,})\s+[A-Za-z]\.?$", r"\1", names["selection"])
         names["event"] = " v ".join(expand_team(apply_aliases(side, profile.aliases)) for side in sig.event.split(" v "))
         sig = sig.model_copy(update=names)
+        if sig.action in ("entry", "add") and is_code(sig.selection):
+            # a code the site's list can't tell ('sw' fits Sharjah Warriors and Scotland Women): the channel's own match
+            found = side_for_code(sig.selection, self._store.channel_matches(self._mode, channel.name, CONTEXT_MATCHES))
+            if found:
+                side, event = found
+                log.info("  '%s' is %s: the team of %s's match %s", sig.selection, side, channel.name, event)
+                sig = sig.model_copy(update={"selection": side, "event": event, "aka": sig.aka or sig.selection})
         if profile.rupees_per_unit and sig.amount and not sig.green_pct:  # the tipster's rupees, not ours
             sig = sig.model_copy(update={"units": round(sig.amount / profile.rupees_per_unit, 2), "amount": None})
         if (sig.action == "add" and sig.units is None and sig.amount is None and SMALL_STAKE.search(text)

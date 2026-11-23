@@ -370,6 +370,14 @@ class Store:
         ).fetchone()
         return Position(*row) if row else None
 
+    def channel_matches(self, mode: str, channel: str, within: timedelta) -> list[str]:
+        """Match names of the channel's trades opened within `within`, open or closed, newest first."""
+        since = (clock() - within).isoformat(timespec="seconds")
+        rows = self._db.execute(
+            "SELECT event FROM positions WHERE mode = ? AND COALESCE(channel, '') = ? AND opened_at >= ? ORDER BY id DESC",
+            (mode, channel, since)).fetchall()
+        return list(dict.fromkeys(event for (event,) in rows if event))
+
     def last_booked_profit(self, mode: str, channel: str, within: timedelta) -> float | None:
         """Profit locked by the channel's latest bookset within `within` (for "green money 20%" re-entries)."""
         since = (clock() - within).isoformat(timespec="seconds")
