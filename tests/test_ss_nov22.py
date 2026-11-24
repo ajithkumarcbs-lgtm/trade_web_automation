@@ -351,6 +351,47 @@ def test_a_second_entry_in_the_same_match_finds_the_team_by_its_code(store):
     assert store.find_position("Sharjah Warriors", "live").event == SW_DV
 
 
+# --- 24 Nov: 'mi' opened a tennis match ---------------------------------------------------------------------------
+
+MI_LIST = ["Adr Oetzbach v Ro Guna", "Uchida v Mi Leong", "Sharjah Warriors v Desert Vipers", "Gulf Giants v MI Emirates"]
+MI_SPORTS = ["tennis", "tennis", "cricket", "cricket"]
+
+
+def test_the_header_time_reads_today_and_tomorrow():
+    now = datetime(2026, 11, 24, 20, 33)
+    assert _parse_match_start("UCHIDA V MI LEONG (Tomorrow 6:30 AM)", now) == datetime(2026, 11, 25, 6, 30)
+    assert _parse_match_start("(Today 8:00 PM)", now) == datetime(2026, 11, 24, 20, 0)
+    assert _parse_match_start("(Nov 24, 8:00 PM)", now) == datetime(2026, 11, 24, 20, 0)
+
+
+def test_other_sports_are_left_out_of_the_list():
+    assert ExchangeBot._in_sport(MI_LIST, MI_SPORTS, "cricket") == ["", "", MI_LIST[2], MI_LIST[3]]
+    assert ExchangeBot._in_sport(MI_LIST, [], "cricket") == MI_LIST  # sports not read: the whole list, as before
+    assert ExchangeBot._in_sport(MI_LIST, MI_SPORTS, "") == MI_LIST
+
+
+def test_a_cricket_tip_opens_only_cricket_matches(store):
+    """24 Nov 20:33 '5 odds back mi limit 0.5' opened 'Uchida v Mi Leong' (tennis, the next morning) for its 'Mi' and
+    waited 20 minutes on its suspended market; Gulf Giants v MI Emirates was the match being played."""
+    assert MI_LIST[_best_index(MI_LIST, "MI", "MI")] == "Uchida v Mi Leong"  # the list alone: the tennis match
+    for sport, expected in (("cricket", "Gulf Giants v MI Emirates"), ("", "Uchida v Mi Leong")):
+        bot = bot_for(store)
+        bot._page = ListPage(MI_LIST)
+        opened = []
+
+        async def enter(match, reload):
+            opened.append(match)
+            bot._match_name = match
+            return True
+
+        async def sports():
+            return MI_SPORTS
+
+        bot._open_list, bot._enter_listed, bot._row_sports = nothing, enter, sports
+        asyncio.run(bot._open_match("MI v ?", "MI", "", sport=sport))
+        assert opened[0] == expected
+
+
 # --- the balance -------------------------------------------------------------------------------------------
 
 def test_a_short_balance_cuts_the_stake_instead_of_skipping():

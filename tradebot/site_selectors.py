@@ -6,6 +6,8 @@ site's code, Oct 2026. The bot finds the match in the home list, opens its match
 # Home page lists in-play and upcoming cricket and tennis matches.
 LIST_PATH = "/"
 MATCH_URL = "**/sports/details/**"
+# The home list's section headings ('Cricket', 'Tennis', 'Soccer'): each listed match sits under its sport's heading
+SPORT_HEADER = "span.uppercase.ml-2.font-semibold"
 
 # Header LOGIN button (shown only when logged out) opens the "Login Now" form.
 LOGGED_OUT = 'button:text-is("LOGIN")'

@@ -331,7 +331,7 @@ class SignalParser:
         """The side of the site's list ('T Griekspoor') that a tip's short name ('Tallon') means, as listed, or
         None when no model can tell. Each model knows different players (28 Oct: Qwen knew Zizou Bergs and Jacob
         Fearnley, gpt-oss Tallon Griekspoor and Frances Tiafoe), so the next one is asked when one can't say."""
-        matches = "\n".join(f"{i}. {n[:60]}" for i, n in enumerate(listed))
+        matches = "\n".join(f"{i}. {n[:60]}" for i, n in enumerate(listed) if n)  # blank: another sport's match
         prompt = f"The tip names: {name} (its match: {event})\nListed matches:\n{matches}"
         async for model, reply in self._json_replies(PICK_SIDE, prompt):
             side = _listed_side(reply, listed)

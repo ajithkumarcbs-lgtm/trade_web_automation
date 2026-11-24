@@ -231,7 +231,7 @@ class ExchangeBot:
         market is suspended or the match can't be found. Reads only; places nothing."""
         async with self._using_page():
             try:
-                await self._open_match(pos.event, pos.selection)
+                await self._open_match(pos.event, pos.selection, sport=pos.sport)
                 _, price = await self._odds_box(pos.selection, exit_side(pos), need_price=False)
                 return price
             except (BetAborted, PlaywrightTimeout) as exc:
@@ -242,7 +242,7 @@ class ExchangeBot:
         """The price on offer for this entry right now, None if the site doesn't list it yet. Reads only."""
         async with self._using_page():
             try:
-                name = await self._open_match(sig.event, sig.selection, sig.aka)
+                name = await self._open_match(sig.event, sig.selection, sig.aka, sport=sig.sport)
                 _, price = await self._odds_box(name, sig.side, need_price=False)
                 return price
             except (BetAborted, PlaywrightTimeout) as exc:
@@ -253,7 +253,7 @@ class ExchangeBot:
         """The prices now of the team playing this one (SK Astro's method lays it). Reads only."""
         async with self._using_page():
             try:
-                name = await self._open_match(event, team)
+                name = await self._open_match(event, team, sport="cricket")
                 _, team_back = await self._odds_box(name, "back", need_price=False)  # finds the team's row
                 other = await self._other_runner()
                 if other is None:
@@ -277,7 +277,7 @@ class ExchangeBot:
             return None
         async with self._using_page():
             try:
-                await self._open_match(event, plain_team(team))
+                await self._open_match(event, plain_team(team), sport="cricket")
                 rows = self._page.locator(sel.FANCY_ROW)
                 await rows.first.wait_for(timeout=8000)
                 names = await rows.evaluate_all("(els, name) => els.map(e => e.querySelector(name)?.innerText || '')",
@@ -335,7 +335,7 @@ class ExchangeBot:
         """Back or lay at the best price on offer now, if it is still close to the tip's price.
         A back above MAX_BACK_ODDS (the site refuses those) is placed as a lay of the opponent instead.
         The result carries the site's names of the runner and match, which the trade is recorded under."""
-        name = await self._open_match(sig.event, sig.selection, sig.aka)
+        name = await self._open_match(sig.event, sig.selection, sig.aka, sport=sig.sport)
         match = self._match_name
         limit = self._s.max_back_odds
         for attempt in range(2):
@@ -462,7 +462,7 @@ class ExchangeBot:
     async def cancel_waiting(self, pos: Position) -> float:
         """Cancels the waiting (unmatched) bets on this trade's match; returns their total stake."""
         async with self._using_page():
-            await self._open_match(pos.event, pos.selection)
+            await self._open_match(pos.event, pos.selection, sport=pos.sport)
             return await self._cancel_unmatched()
 
     async def _odds_box_when_open(self, selection: str, side: str,
@@ -498,7 +498,7 @@ class ExchangeBot:
     async def _place_exit(self, sig: BetSignal, pos: Position) -> BetResult:
         """Book the trade at the tipster's price: an equal-profit opposite bet that waits (unmatched) until
         the price is reached. A newer exit replaces the earlier waiting one."""
-        await self._open_match(pos.event, pos.selection)
+        await self._open_match(pos.event, pos.selection, sport=pos.sport)
         filled = 0.0
         if pos.exit_price is not None:
             remaining = await self._cancel_unmatched()
@@ -534,9 +534,9 @@ class ExchangeBot:
         says the bet is still going on / suspended), so the caller tries again."""
         if pos is None:
             log.info("  no trade recorded by the bot; cashing out the site's position on this match")
-            name = await self._open_match(_match_to_find(sig), sig.selection, sig.aka)
+            name = await self._open_match(_match_to_find(sig), sig.selection, sig.aka, sport=sig.sport)
         else:
-            name = await self._open_match(pos.event, pos.selection)
+            name = await self._open_match(pos.event, pos.selection, sport=pos.sport)
         if pos and pos.exit_price is not None:  # a Limit exit may still be waiting
             await self._cancel_unmatched()
         page = self._page
@@ -810,15 +810,17 @@ class ExchangeBot:
         await page.wait_for_timeout(1500)  # the after-login ad appears a moment later
         await self._dismiss_popups()
 
-    async def _open_match(self, event_name: str, selection: str = "", aka: str = "") -> str:
+    async def _open_match(self, event_name: str, selection: str = "", aka: str = "", sport: str = "") -> str:
         """Finds the match in the home list and opens its match page. Only matches that include the
         selection (the player being bet on) are considered. aka is the rules' spelling of the same player
         ('gea' where the AI wrote 'Gaea'): tried too, and when the two names are in different matches nothing
-        is opened. Returns the name that found the match, to find the runner's row with."""
+        is opened. sport ('cricket', 'tennis', 'football'): only the list's section of that sport is looked at.
+        Returns the name that found the match, to find the runner's row with."""
         await self._open_list()
         page = self._page
         rows = page.locator(sel.EVENT_ROW)
         names = await rows.locator(sel.EVENT_NAME).all_inner_texts()  # one name per row, same order
+        names = self._in_sport(names, await self._row_sports() if sport in SITE_SPORTS.values() else [], sport)
         target = re.sub(r"\s+v\s+\?$", "", event_name)
         tried = [selection] + ([aka] if aka.strip(" ?") and aka.lower() != selection.lower() else [])
         found = {name: index for name in tried if (index := _best_index(names, target, name)) is not None}
@@ -856,6 +858,26 @@ class ExchangeBot:
         if first.strip() != self._match_name and await self._enter_listed(first, reload=True):
             log.info("  site match: %s (the first listed match of %s)", first, name)
         return name
+
+    async def _row_sports(self) -> list[str]:
+        """The sport of each listed match, from the section heading above it ('Cricket', 'Tennis', 'Soccer'); [] when the
+        page can't tell. 24 Nov SS's '5 odds back mi limit 0.5' opened 'Uchida v Mi Leong', a tennis match of the next
+        morning, for its 'Mi', and waited 20 minutes on its suspended market while Gulf Giants v MI Emirates was played."""
+        try:
+            heads = await self._page.evaluate(ROW_SPORTS_JS, [sel.EVENT_ROW, sel.SPORT_HEADER])
+            return [SITE_SPORTS.get((head or "").strip().lower(), "") for head in heads]
+        except Exception:  # the filter must never stop a bet: without it every listed match is looked at, as before
+            log.warning("  could not read the list's sports", exc_info=True)
+            return []
+
+    @staticmethod
+    def _in_sport(names: list[str], sports: list[str], sport: str) -> list[str]:
+        """The list with the matches of other sports blanked (same positions); as it is when the sports can't be read."""
+        if not sport or len(sports) != len(names) or sport not in sports:
+            return names
+        kept = [name if row_sport in ("", sport) else "" for name, row_sport in zip(names, sports)]
+        log.info("  %s: %d of %d listed matches", sport, sum(1 for name in kept if name), len(names))
+        return kept
 
     async def _enter_listed(self, match: str, reload: bool) -> bool:
         """Opens the page of the listed match of this name (the list loaded again first when reload); False when the
@@ -1233,16 +1255,38 @@ def _rate_over(reason: str) -> bool:
 
 
 MATCH_AHEAD = timedelta(hours=12)  # a listed match starting later than this is not the one a live tip is about
-MATCH_TIME = re.compile(r"\(\s*([A-Z][a-z]{2})\s+(\d{1,2}),\s*(\d{1,2}):(\d{2})\s*([AP]M)\s*\)")
+# '(Nov 24, 8:00 PM)', and for the next two days '(Today 8:00 PM)' / '(Tomorrow 6:30 AM)' (24 Nov, Uchida v Mi Leong)
+MATCH_TIME = re.compile(r"\(\s*(?:([A-Z][a-z]{2})\s+(\d{1,2}),|(Today|Tomorrow))\s*(\d{1,2}):(\d{2})\s*([AP]M)\s*\)")
+# The home list's sections, as the bot names sports
+SITE_SPORTS = {"cricket": "cricket", "tennis": "tennis", "soccer": "football", "football": "football"}
+# For each listed match (rows[0] selector), the text of the last section heading (rows[1]) before it in the page
+ROW_SPORTS_JS = """([rowSel, headSel]) => {
+  const heads = Array.from(document.querySelectorAll(headSel));
+  return Array.from(document.querySelectorAll(rowSel)).map(row => {
+    let sport = "";
+    for (const head of heads) {
+      if (head.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING) sport = head.textContent.trim();
+    }
+    return sport;
+  });
+}"""
 
 
 def _parse_match_start(text: str, now: datetime) -> datetime | None:
-    """'(Nov 24, 8:00 PM)' -> 24 Nov 20:00 of this year (next year when that would be long past)."""
+    """'(Nov 24, 8:00 PM)' -> 24 Nov 20:00 of this year (next year when that would be long past); '(Tomorrow 6:30 AM)'
+    -> 6:30 the day after `now`."""
     m = MATCH_TIME.search(text or "")
     if not m:
         return None
     try:
-        start = datetime.strptime(f"{m[1]} {m[2]} {now.year} {m[3]}:{m[4]} {m[5]}", "%b %d %Y %I:%M %p")
+        clock = datetime.strptime(f"{m[4]}:{m[5]} {m[6]}", "%I:%M %p").time()
+    except ValueError:
+        return None
+    if m[3]:
+        day = now.date() + timedelta(days=1 if m[3] == "Tomorrow" else 0)
+        return datetime.combine(day, clock)
+    try:
+        start = datetime.strptime(f"{m[1]} {m[2]} {now.year}", "%b %d %Y").replace(hour=clock.hour, minute=clock.minute)
     except ValueError:
         return None
     return start.replace(year=now.year + 1) if start < now - timedelta(days=180) else start
